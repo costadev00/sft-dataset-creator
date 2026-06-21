@@ -1,0 +1,130 @@
+{
+  "name": "wikipedia-ptbr-sft",
+  "language": "pt-BR",
+  "profile": "wikipedia_ptbr",
+  "source": {
+    "plugin": "huggingface",
+    "params": {
+      "dataset": "costadev00/wikipedia-pt-br-extract",
+      "split": "train",
+      "streaming": true,
+      "cache_dir": "/scratch/user/matheuscm/sft-dataset-creator/huggingface"
+    },
+    "field_map": {
+      "id": "page_id",
+      "text": "text",
+      "title": "title",
+      "sections": "section_texts",
+      "license": "license"
+    }
+  },
+  "selection": {
+    "count": 5000,
+    "fraction": null,
+    "seed": 42,
+    "strata": [],
+    "filters": {}
+  },
+  "target": {
+    "examples": 10000,
+    "per_document": {"minimum": 1, "maximum": 3},
+    "reserve_fraction": 0.25,
+    "same_document_attempts": 2,
+    "max_attempts_per_slot": 3,
+    "max_total_attempt_multiplier": 2.0,
+    "chunk_size_characters": 8000,
+    "chunk_overlap_characters": 400
+  },
+  "composition": {
+    "tasks": {
+      "counts": null,
+      "weights": {
+        "closed_qa": 0.25,
+        "summarization": 0.2,
+        "information_extraction": 0.2,
+        "concept_explanation": 0.2,
+        "classification": 0.15
+      }
+    },
+    "difficulties": {
+      "counts": null,
+      "weights": {"easy": 0.25, "medium": 0.5, "hard": 0.25}
+    },
+    "grounding_required": true
+  },
+  "generation": {
+    "plugin": "vllm_local",
+    "params": {
+      "tensor_parallel_size": 4,
+      "gpu_memory_utilization": 0.9,
+      "dtype": "bfloat16",
+      "enable_thinking": false,
+      "max_num_seqs": 16,
+      "max_num_batched_tokens": 16384,
+      "enable_chunked_prefill": true,
+      "enable_prefix_caching": true
+    },
+    "model": "google/gemma-4-26B-A4B-it",
+    "model_revision": null,
+    "context_window": 65536,
+    "max_input_tokens": 53248,
+    "max_output_tokens": 4096,
+    "temperature": 0.1,
+    "batching": {
+      "mode": "async",
+      "max_inflight_requests": 32,
+      "queue_capacity": 64,
+      "preparation_batch_size": 128,
+      "request_timeout_seconds": 900.0
+    }
+  },
+  "evaluation": {
+    "deterministic": true,
+    "llm": {
+      "plugin": "vllm_local",
+      "params": {
+        "tensor_parallel_size": 4,
+        "gpu_memory_utilization": 0.9,
+        "quantization": "compressed-tensors",
+        "enable_thinking": true,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 16384,
+        "enable_chunked_prefill": true,
+        "enable_prefix_caching": true
+      },
+      "model": "google/gemma-4-31B-it-qat-w4a16-ct",
+      "model_revision": null,
+      "context_window": 65536,
+      "max_input_tokens": 53248,
+      "max_output_tokens": 4096,
+      "temperature": 0.1,
+      "batching": {
+        "mode": "async",
+        "max_inflight_requests": 32,
+        "queue_capacity": 64,
+        "preparation_batch_size": 128,
+        "request_timeout_seconds": 900.0
+      }
+    },
+    "routing": {
+      "audit_fraction": 0.1,
+      "judge_hard_tasks": true,
+      "judge_truncated_context": true,
+      "judge_high_risk": true,
+      "judge_weak_grounding": true
+    },
+    "acceptance": {"overall_score": 4.0, "grounding_score": 4.0}
+  },
+  "output": {
+    "formats": ["messages", "prompt_completion", "alpaca"],
+    "containers": ["jsonl", "parquet"],
+    "splits": {"train": 0.9, "validation": 0.05, "test": 0.05}
+  },
+  "runtime": {
+    "run_root": "/scratch/user/matheuscm/sft-dataset-creator/runs",
+    "cache_dir": "/scratch/user/matheuscm/sft-dataset-creator/cache",
+    "store_model_io": true,
+    "fail_on_partial": true
+  },
+  "publish": {"repo_id": null, "private": true, "token_env": "HF_TOKEN"}
+}

@@ -1,0 +1,67 @@
+{
+  "name": "local-smoke-test",
+  "language": "en",
+  "profile": null,
+  "source": {
+    "plugin": "local",
+    "params": {"path": "corpus.jsonl", "format": "jsonl"},
+    "field_map": {"id": "id", "text": "text", "title": "title", "sections": "sections"}
+  },
+  "selection": {"count": 20, "fraction": null, "seed": 42, "strata": [], "filters": {}},
+  "target": {
+    "examples": 10,
+    "per_document": {"minimum": 1, "maximum": 2},
+    "reserve_fraction": 0.25,
+    "same_document_attempts": 2,
+    "max_attempts_per_slot": 3,
+    "max_total_attempt_multiplier": 2.0,
+    "chunk_size_characters": 8000,
+    "chunk_overlap_characters": 400
+  },
+  "composition": {
+    "tasks": {"counts": null, "weights": {"closed_qa": 0.5, "summarization": 0.5}},
+    "difficulties": {"counts": null, "weights": {"easy": 0.5, "medium": 0.5}},
+    "grounding_required": true
+  },
+  "generation": {
+    "plugin": "fake",
+    "params": {},
+    "model": "fake-generator",
+    "model_revision": null,
+    "context_window": 65536,
+    "max_input_tokens": 53248,
+    "max_output_tokens": 4096,
+    "temperature": 0.1,
+    "batching": {
+      "mode": "async",
+      "max_inflight_requests": 8,
+      "queue_capacity": 16,
+      "preparation_batch_size": 32,
+      "request_timeout_seconds": 60.0
+    }
+  },
+  "evaluation": {
+    "deterministic": true,
+    "llm": null,
+    "routing": {
+      "audit_fraction": 0.1,
+      "judge_hard_tasks": true,
+      "judge_truncated_context": true,
+      "judge_high_risk": true,
+      "judge_weak_grounding": true
+    },
+    "acceptance": {"overall_score": 4.0, "grounding_score": 4.0}
+  },
+  "output": {
+    "formats": ["messages", "prompt_completion", "alpaca"],
+    "containers": ["jsonl"],
+    "splits": {"train": 0.9, "validation": 0.05, "test": 0.05}
+  },
+  "runtime": {
+    "run_root": "runs",
+    "cache_dir": ".cache/sft-dataset-creator",
+    "store_model_io": true,
+    "fail_on_partial": true
+  },
+  "publish": {"repo_id": null, "private": true, "token_env": "HF_TOKEN"}
+}
