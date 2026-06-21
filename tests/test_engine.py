@@ -57,6 +57,13 @@ def test_export_with_train_only_omits_disabled_splits(project_config, tmp_path) 
     assert (format_dir / "train.jsonl").is_file()
     assert not (format_dir / "validation.jsonl").exists()
     assert not (format_dir / "test.jsonl").exists()
+    card = (run_dir / "exports" / "README.md").read_text(encoding="utf-8")
+    assert card.startswith("---\nconfigs:")
+    assert "- config_name: messages" in card
+    assert "path: messages/train.jsonl" in card
+    assert "path: messages/validation.jsonl" not in card
+    assert (run_dir / "exports" / "generation_info.json").is_file()
+    assert not (run_dir / "exports" / "dataset_info.json").exists()
 
 
 def test_export_refuses_source_dependent_accepted_candidate(project_config, tmp_path) -> None:

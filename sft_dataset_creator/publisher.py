@@ -35,5 +35,12 @@ def publish_run(
         repo_type="dataset",
         folder_path=exports,
         commit_message=f"Publish synthetic SFT run {root.name}",
+        delete_patterns=[
+            "dataset_info.json",
+            "generation_info.json",
+            "messages/*",
+            "prompt_completion/*",
+            "alpaca/*",
+        ],
     )
     return f"https://huggingface.co/datasets/{target_repo}"
