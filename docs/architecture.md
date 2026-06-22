@@ -4,6 +4,8 @@
 
 The public Python surface consists of `ProjectConfig`, `BatchingConfig`, `BatchGenerationResult`, `load_config`, `build_plan`, `execute_plan`, `tune_project`, `export_run`, and `publish_run`. Core records use Pydantic and reject unknown fields.
 
+The `run` CLI builds `ProjectConfig` directly from typed command-line options. The resolved model is persisted as `config.resolved.json`; it is an execution artifact rather than a required user input.
+
 Extension points are Python Protocols discovered through these entry-point groups:
 
 - `sft_dataset_creator.sources`

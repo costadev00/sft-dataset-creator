@@ -12,5 +12,6 @@ dist/
 *.egg-info/
 .cache/
 runs/
+outputs/
 models/
 tmp/

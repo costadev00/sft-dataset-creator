@@ -90,7 +90,7 @@ def collect_doctor_report(config: ProjectConfig | None = None, *, smoke_models: 
         "plugins": available_plugins(),
         "packages": {
             name: importlib.util.find_spec(name) is not None
-            for name in ("pydantic", "typer", "rich", "InquirerPy", "datasets", "vllm", "openai", "pyarrow")
+            for name in ("pydantic", "typer", "rich", "datasets", "vllm", "openai", "pyarrow")
         },
         "paths": [],
         "models": [],

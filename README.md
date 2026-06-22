@@ -2,7 +2,7 @@
 
 `sft-dataset-creator` is a Python library and CLI for planning, generating, evaluating, exporting, and publishing reproducible synthetic supervised fine-tuning datasets.
 
-The framework is source-agnostic and model-agnostic. A project describes the desired corpus selection, final example count, task and difficulty composition, grounding policy, replacement limits, model backends, and output views. The planner turns that specification into an immutable execution plan before any generation call is made.
+The framework is source-agnostic and model-agnostic. A run is declared directly through CLI options: corpus selection, final example count, task and difficulty composition, replacement limits, model backends, and output views. The planner turns those options into a validated, immutable execution plan before any generation call is made.
 
 ## Core workflow
 
@@ -40,20 +40,42 @@ to change model behavior without navigating execution or backend code.
 
 ## CLI
 
-Create a configuration interactively:
+Run directly from a Hugging Face dataset id. No input configuration file is required:
 
 ```bash
-sft-dataset wizard --output project.json
+sft-dataset run \
+  --dataset costadev00/wiki-brazil \
+  --examples 1000 \
+  --language pt-BR \
+  --id-field __row_index__ \
+  --generator-param tensor_parallel_size=4 \
+  --run-dir runs/wiki-brazil
 ```
 
-The remaining commands are non-interactive and automation-safe:
+`huggingface`, `train`, streaming mode, the Gemma generator, the built-in task mix, and JSONL exports are defaults. Use `sft-dataset run --help` for all source, selection, model, retry, evaluation, and output options.
+
+Local JSON, JSONL, and Parquet corpora use the same command:
 
 ```bash
-sft-dataset validate --config project.json
-sft-dataset doctor --config project.json
-sft-dataset tune --config project.json --output project.tuned.json
-sft-dataset plan --config project.json
-sft-dataset run --config project.json
+sft-dataset run \
+  --dataset corpus.jsonl \
+  --source local \
+  --examples 100 \
+  --generator-plugin fake \
+  --model fake-generator
+```
+
+Repeat weighted options and backend parameters as needed:
+
+```bash
+--task closed_qa=0.6 --task summarization=0.4
+--difficulty easy=0.25 --difficulty medium=0.5 --difficulty hard=0.25
+--generator-param tensor_parallel_size=4 --generator-param dtype=bfloat16
+```
+
+Run management remains non-interactive and automation-safe:
+
+```bash
 sft-dataset run --resume runs/<run-id>
 sft-dataset status runs/<run-id>
 sft-dataset inspect runs/<run-id> --limit 10
@@ -63,9 +85,7 @@ sft-dataset export runs/<run-id>
 sft-dataset publish runs/<run-id> --repo-id owner/dataset
 ```
 
-`doctor --smoke-models` loads configured models sequentially and performs a structured-output request. It can download large checkpoints and is intentionally opt-in.
-
-`tune` benchmarks a serial baseline and progressively larger async profiles. It writes the selected limits into a new reproducible configuration and records throughput, latency, VRAM, GPU utilization, package versions, and failures in a sibling tuning report.
+Every run writes `config.resolved.json`. This is an output artifact used for hashing, auditing, export, and resume; users do not need to create it.
 
 ## Built-in integrations
 
@@ -78,25 +98,38 @@ sft-dataset publish runs/<run-id> --repo-id owner/dataset
 
 Third-party packages can register sources, task recipes, backends, evaluators, and exporters through Python entry points. See [the architecture guide](docs/architecture.md).
 
-## Cluster preset
+## Local GPU example
 
-[examples/gemma-wikipedia.json](examples/gemma-wikipedia.json) targets four NVIDIA RTX 4000 Ada GPUs:
+The default generator is `google/gemma-4-26B-A4B-it`. A four-GPU run can add:
 
-- Generator: `google/gemma-4-26B-A4B-it`, BF16, tensor parallel 4.
-- Selective evaluator: `google/gemma-4-31B-it-qat-w4a16-ct`, tensor parallel 4.
-- Context window: 64k with a 52k input budget.
-- Evaluation routing: hard tasks, truncated context, high risk, weak grounding, and a deterministic 10% audit sample.
+```bash
+--generator-param tensor_parallel_size=4 \
+--generator-param dtype=bfloat16 \
+--generator-param enable_chunked_prefill=true \
+--generator-param enable_prefix_caching=true
+```
 
-Generation and evaluation run in separate spawned processes so the first model releases GPU memory before the second is loaded. Inside each process, vLLM `AsyncLLM` receives a bounded stream of concurrent requests and performs continuous batching. Prefix caching and chunked prefill are enabled in the example; run `tune` on the target machine before production.
+Selective LLM evaluation is enabled by passing a judge model:
+
+```bash
+--judge-model google/gemma-4-31B-it-qat-w4a16-ct \
+--judge-param tensor_parallel_size=4 \
+--judge-param quantization=compressed-tensors
+```
+
+Generation and evaluation run in separate spawned processes so the first model releases GPU memory before the second is loaded. Inside each process, vLLM `AsyncLLM` receives a bounded stream of concurrent requests and performs continuous batching. Prefix caching and chunked prefill are enabled by the flags above.
 
 Documents are split into bounded, overlapping character chunks during planning.
 When a document receives multiple examples, its slots iterate over chunk IDs in
 order before cycling back. Configure this with `target.chunk_size_characters`
-and `target.chunk_overlap_characters`.
+and `target.chunk_overlap_characters` internally, exposed as `--chunk-size` and
+`--chunk-overlap` on the CLI.
 
-## Configuration
+## Reproducibility
 
-Configurations are strict JSON. Unknown keys fail validation. Generate an editor-compatible schema with:
+CLI values are converted into strict Pydantic models. Unknown task names, invalid distributions, incompatible split ratios, and invalid token or chunk budgets fail before generation. The resolved configuration is stored in the run directory and tied to `plan.json` by SHA-256.
+
+Advanced integrations can still create and validate `ProjectConfig` JSON programmatically. Generate its schema with:
 
 ```bash
 sft-dataset schema --output sft-project.schema.json
