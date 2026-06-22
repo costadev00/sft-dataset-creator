@@ -131,6 +131,7 @@ class HuggingFaceSource(MappedSource):
         self.subset = config.params.get("subset")
         self.streaming = bool(config.params.get("streaming", True))
         self.cache_dir = config.params.get("cache_dir")
+        self.revision = config.params.get("revision")
 
     def iter_documents(self) -> Iterator[Document]:
         try:
@@ -143,6 +144,7 @@ class HuggingFaceSource(MappedSource):
             split=self.split,
             streaming=self.streaming,
             cache_dir=self.cache_dir,
+            revision=self.revision,
         )
         for index, record in enumerate(dataset):
             yield self.normalize(dict(record), index)

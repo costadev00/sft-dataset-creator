@@ -106,19 +106,44 @@ def collect_doctor_report(config: ProjectConfig | None = None, *, smoke_models: 
         for item in report["paths"]:
             if not item["writable"]:
                 report["errors"].append(f"path is not writable: {item['nearest_existing']}")
-        if config.generation.plugin == "vllm_local" and not report["packages"]["vllm"]:
-            report["errors"].append("vLLM is not installed; install the 'local' extra")
         if config.source.plugin == "huggingface" and not report["packages"]["datasets"]:
             report["errors"].append("datasets is not installed; install the 'hf' extra")
-        if config.generation.plugin == "vllm_local" and len(report["gpus"]) < int(
-            config.generation.params.get("tensor_parallel_size", 1)
+        if config.source.plugin == "huggingface" and not config.source.params.get("revision"):
+            report["warnings"].append(
+                "Hugging Face dataset revision is not pinned; use --dataset-revision for reproducibility"
+            )
+        if "parquet" in config.output.containers and not report["packages"]["pyarrow"]:
+            report["errors"].append("Parquet output requires the 'hf' extra with pyarrow")
+        for stage, model_config in (
+            ("generation", config.generation),
+            ("evaluation", config.evaluation.llm),
         ):
-            report["errors"].append("fewer GPUs detected than generation.tensor_parallel_size")
+            if model_config is None:
+                continue
+            if model_config.plugin == "vllm_local":
+                if not report["packages"]["vllm"]:
+                    report["errors"].append(f"{stage} requires the 'local' extra with vLLM")
+                tensor_parallel_size = int(model_config.params.get("tensor_parallel_size", 1))
+                if len(report["gpus"]) < tensor_parallel_size:
+                    report["errors"].append(
+                        f"fewer GPUs detected than {stage}.tensor_parallel_size"
+                    )
+            if model_config.plugin == "openai_compatible" and not report["packages"]["openai"]:
+                report["errors"].append(f"{stage} requires the 'openai' extra")
+        if config.evaluation.llm is None:
+            report["warnings"].append(
+                "LLM evaluation is disabled; deterministic gates cannot verify semantic grounding"
+            )
         if smoke_models and not report["errors"]:
             for model_config in [config.generation, config.evaluation.llm]:
                 if model_config is not None:
                     try:
-                        report["models"].append(_smoke_backend(model_config))
+                        smoke = _smoke_backend(model_config)
+                        report["models"].append(smoke)
+                        if not smoke["ok"]:
+                            report["errors"].append(
+                                f"model smoke test returned invalid output for {model_config.model}"
+                            )
                     except Exception as exc:
                         report["errors"].append(f"model smoke test failed for {model_config.model}: {exc}")
     report["ready"] = not report["errors"]

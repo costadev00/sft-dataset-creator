@@ -92,7 +92,7 @@ class CompositionConfig(ConfigModel):
     difficulties: DistributionConfig = Field(
         default_factory=lambda: DistributionConfig(weights={"easy": 0.25, "medium": 0.50, "hard": 0.25})
     )
-    grounding_required: bool = True
+    grounding_required: Literal[True] = True
 
 
 class BatchingConfig(ConfigModel):
@@ -140,7 +140,7 @@ class AcceptanceConfig(ConfigModel):
 
 class EvaluationConfig(ConfigModel):
     plugin: str = "composite"
-    deterministic: bool = True
+    deterministic: Literal[True] = True
     llm: GenerationConfig | None = None
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)

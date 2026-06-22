@@ -170,6 +170,7 @@ def test_attempt_limits_produce_explicit_partial_report(project_config, tmp_path
     assert report.accepted_examples == 0
     assert report.attempted_examples == 2
     assert report.deficits == {"closed_qa:easy": 1}
+    assert len(report.metrics["generation"]["rounds"]) == 2
 
 
 def test_parquet_export(project_config, tmp_path) -> None:

@@ -7,6 +7,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -87,27 +88,26 @@ def _generation_jobs(state: RunState, plan: DatasetPlan, config: ProjectConfig) 
     remaining = maximum_attempts - state.counts()["attempted"]
     if remaining <= 0:
         return []
-    accepted = state.accepted_slot_ids()
     existing = state.attempt_keys()
-    document_loads = state.attempted_document_counts()
+    document_loads = state.accepted_document_counts()
     jobs: list[GenerationJob] = []
-    for attempt in range(1, config.target.max_attempts_per_slot + 1):
-        for slot in sorted(plan.slots, key=lambda value: value.ordinal):
-            if slot.id in accepted or (slot.id, attempt) in existing:
-                continue
-            document_id = _document_for_attempt(
-                plan,
-                slot.id,
-                slot.document_id,
-                attempt,
-                config.target.same_document_attempts,
-                document_loads,
-                config.target.per_document.maximum,
-            )
-            jobs.append(GenerationJob(slot=slot, attempt=attempt, document_id=document_id))
+    for slot, attempt in state.pending_slots(config.target.max_attempts_per_slot):
+        if (slot.id, attempt) in existing:
+            continue
+        document_id = _document_for_attempt(
+            plan,
+            slot.id,
+            slot.document_id,
+            attempt,
+            config.target.same_document_attempts,
+            document_loads,
+            config.target.per_document.maximum,
+        )
+        jobs.append(GenerationJob(slot=slot, attempt=attempt, document_id=document_id))
+        if attempt > config.target.same_document_attempts:
             document_loads[document_id] = document_loads.get(document_id, 0) + 1
-            if len(jobs) >= remaining:
-                return jobs
+        if len(jobs) >= remaining:
+            break
     return jobs
 
 
@@ -205,6 +205,53 @@ def _empty_stage_metrics() -> dict[str, Any]:
     )
 
 
+def _aggregate_stage_metrics(rounds: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not rounds:
+        return {**_empty_stage_metrics(), "rounds": []}
+    requests = sum(int(item["requests"]) for item in rounds)
+    duration = sum(float(item["duration_seconds"]) for item in rounds)
+    startup = sum(float(item["model_startup_seconds"]) for item in rounds)
+    input_tokens = sum(int(item["input_tokens"]) for item in rounds)
+    output_tokens = sum(int(item["output_tokens"]) for item in rounds)
+    weighted_p50 = (
+        sum(float(item["latency_p50_seconds"]) * int(item["requests"]) for item in rounds) / requests
+        if requests
+        else 0.0
+    )
+    gpu_samples = sum(int(item["gpu"].get("sample_count") or 0) for item in rounds)
+    utilization_weight = sum(
+        float(item["gpu"].get("average_utilization_percent") or 0.0)
+        * int(item["gpu"].get("sample_count") or 0)
+        for item in rounds
+    )
+    peak_values = [
+        float(item["gpu"]["peak_memory_used_mb"])
+        for item in rounds
+        if item["gpu"].get("peak_memory_used_mb") is not None
+    ]
+    return {
+        "requests": requests,
+        "duration_seconds": round(duration, 3),
+        "model_startup_seconds": round(startup, 3),
+        "requests_per_minute": round(requests * 60 / duration, 3) if duration else 0.0,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tokens_per_second": round((input_tokens + output_tokens) / duration, 3) if duration else 0.0,
+        "latency_p50_seconds": round(weighted_p50, 3),
+        "latency_p95_seconds": max(float(item["latency_p95_seconds"]) for item in rounds),
+        "max_worker_queue_depth": max(int(item["max_worker_queue_depth"]) for item in rounds),
+        "gpu": {
+            "sample_count": gpu_samples,
+            "gpu_count": max(int(item["gpu"].get("gpu_count") or 0) for item in rounds),
+            "average_utilization_percent": (
+                round(utilization_weight / gpu_samples, 2) if gpu_samples else None
+            ),
+            "peak_memory_used_mb": max(peak_values) if peak_values else None,
+        },
+        "rounds": list(rounds),
+    }
+
+
 def _generate(
     state: RunState,
     jobs: Sequence[GenerationJob],
@@ -212,11 +259,14 @@ def _generate(
     plan: DatasetPlan,
     config: ProjectConfig,
     callback: EventCallback | None,
+    round_number: int,
+    counter: Any,
+    generator_process: BackendProcess | None = None,
+    record_startup: bool = True,
 ) -> dict[str, Any]:
     if not jobs:
         return _empty_stage_metrics()
-    _emit(callback, "generation_started", {"round": "speculative", "slots": len(jobs)})
-    counter = create_token_counter(config.generation)
+    _emit(callback, "generation_started", {"round": round_number, "slots": len(jobs)})
     job_by_id = {job.request_id: job for job in jobs}
     prepared: dict[str, GenerationRequest] = {}
     prepared_lock = threading.Lock()
@@ -230,8 +280,13 @@ def _generate(
     startup_seconds = 0.0
     duration = 0.0
     gpu: dict[str, Any] = {}
-    with BackendProcess(config.generation) as generator:
-        startup_seconds = generator.startup_seconds
+    backend_context = (
+        nullcontext(generator_process)
+        if generator_process is not None
+        else BackendProcess(config.generation)
+    )
+    with backend_context as generator:
+        startup_seconds = generator.startup_seconds if record_startup else 0.0
         monitor.start()
         started = time.perf_counter()
         stream = _request_stream(
@@ -313,17 +368,20 @@ def _generate(
         finally:
             duration = time.perf_counter() - started
             gpu = monitor.stop()
-    _emit(callback, "generation_finished", {"round": "speculative", "generated": generated})
-    return stage_metrics(
-        requests=len(jobs),
-        duration_seconds=duration,
-        startup_seconds=startup_seconds,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        latencies=latencies,
-        max_queue_depth=max_queue_depth,
-        gpu=gpu,
-    )
+    _emit(callback, "generation_finished", {"round": round_number, "generated": generated})
+    return {
+        **stage_metrics(
+            requests=len(jobs),
+            duration_seconds=duration,
+            startup_seconds=startup_seconds,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latencies=latencies,
+            max_queue_depth=max_queue_depth,
+            gpu=gpu,
+        ),
+        "round": round_number,
+    }
 
 
 def _judge(
@@ -332,10 +390,11 @@ def _judge(
     plan: DatasetPlan,
     config: ProjectConfig,
     callback: EventCallback | None,
+    round_number: int,
 ) -> tuple[dict[str, EvaluationResult], dict[str, Any]]:
     if not routed or config.evaluation.llm is None:
         return {}, _empty_stage_metrics()
-    _emit(callback, "evaluation_started", {"round": "speculative", "candidates": len(routed)})
+    _emit(callback, "evaluation_started", {"round": round_number, "candidates": len(routed)})
     results: dict[str, EvaluationResult] = {}
     latencies: list[float] = []
     input_tokens = 0
@@ -403,17 +462,20 @@ def _judge(
         finally:
             duration = time.perf_counter() - started
             gpu = monitor.stop()
-    _emit(callback, "evaluation_finished", {"round": "speculative"})
-    return results, stage_metrics(
-        requests=len(routed),
-        duration_seconds=duration,
-        startup_seconds=startup_seconds,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        latencies=latencies,
-        max_queue_depth=max_queue_depth,
-        gpu=gpu,
-    )
+    _emit(callback, "evaluation_finished", {"round": round_number})
+    return results, {
+        **stage_metrics(
+            requests=len(routed),
+            duration_seconds=duration,
+            startup_seconds=startup_seconds,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latencies=latencies,
+            max_queue_depth=max_queue_depth,
+            gpu=gpu,
+        ),
+        "round": round_number,
+    }
 
 
 def _evaluate_generated(
@@ -422,6 +484,7 @@ def _evaluate_generated(
     plan: DatasetPlan,
     config: ProjectConfig,
     callback: EventCallback | None,
+    round_number: int,
 ) -> dict[str, Any]:
     strategy = create("evaluators", config.evaluation.plugin, config.evaluation)
     ordinal = {slot.id: slot.ordinal for slot in plan.slots}
@@ -438,7 +501,7 @@ def _evaluate_generated(
         preliminary = strategy.deterministic(candidate, document, accepted_at_start)
         if preliminary.verdict == "accept" and strategy.should_route(candidate, preliminary, plan.seed):
             routed.append((candidate, document))
-    llm_results, metrics = _judge(strategy, routed, plan, config, callback)
+    llm_results, metrics = _judge(strategy, routed, plan, config, callback, round_number)
 
     accepted = list(state.accepted_candidates())
     accepted_slots = {candidate.slot_id for candidate in accepted}
@@ -464,7 +527,7 @@ def _evaluate_generated(
         if evaluation.verdict == "accept":
             accepted.append(candidate)
             accepted_slots.add(candidate.slot_id)
-    return metrics
+    return metrics if "round" in metrics else {**metrics, "round": round_number}
 
 
 def execute_plan(
@@ -483,14 +546,59 @@ def execute_plan(
     _update_manifest(target_dir, "running")
     with RunState(database) as state:
         state.initialize(plan)
+        generation_rounds: list[dict[str, Any]] = []
+        evaluation_rounds: list[dict[str, Any]] = []
+        recovered_metrics = _evaluate_generated(state, documents, plan, config, callback, 0)
+        if recovered_metrics["requests"]:
+            evaluation_rounds.append(recovered_metrics)
+        round_number = 0
+        counts = state.counts()
         jobs = _generation_jobs(state, plan, config)
-        generation_metrics = _generate(state, jobs, documents, plan, config, callback)
-        evaluation_metrics = _evaluate_generated(state, documents, plan, config, callback)
+        counter = create_token_counter(config.generation) if jobs else None
+        local_model_swap = (
+            config.generation.plugin == "vllm_local"
+            and config.evaluation.llm is not None
+            and config.evaluation.llm.plugin == "vllm_local"
+        )
+
+        def execute_round(generator_process: BackendProcess | None = None) -> None:
+            nonlocal counts, jobs, round_number
+            round_number += 1
+            generation_rounds.append(
+                _generate(
+                    state,
+                    jobs,
+                    documents,
+                    plan,
+                    config,
+                    callback,
+                    round_number,
+                    counter,
+                    generator_process=generator_process,
+                    record_startup=generator_process is None or round_number == 1,
+                )
+            )
+            evaluation_rounds.append(
+                _evaluate_generated(state, documents, plan, config, callback, round_number)
+            )
+            counts = state.counts()
+            _emit(callback, "round_finished", {"round": round_number, **counts})
+            jobs = _generation_jobs(state, plan, config)
+
+        if jobs and not local_model_swap:
+            with BackendProcess(config.generation) as generator_process:
+                while jobs and counts["accepted"] < config.target.examples:
+                    execute_round(generator_process)
+        else:
+            while jobs and counts["accepted"] < config.target.examples:
+                execute_round()
+
+        generation_metrics = _aggregate_stage_metrics(generation_rounds)
+        evaluation_metrics = _aggregate_stage_metrics(evaluation_rounds)
         counts = state.counts()
         status = "completed" if counts["accepted"] >= config.target.examples else "partial"
         tokens = state.token_totals()
         state.event("run_finished", {"status": status, **counts})
-        _emit(callback, "round_finished", {"round": "speculative", **counts})
         report = RunReport(
             run_id=plan.run_id,
             status=status,
@@ -504,6 +612,10 @@ def execute_plan(
             deficits=state.deficits(),
             metrics={
                 "acceptance_rate": counts["accepted"] / counts["attempted"] if counts["attempted"] else 0.0,
+                "llm_judge_coverage": (
+                    counts["llm_judged"] / counts["attempted"] if counts["attempted"] else 0.0
+                ),
+                "semantic_judge_configured": config.evaluation.llm is not None,
                 "python": platform.python_version(),
                 "generation": generation_metrics,
                 "evaluation": evaluation_metrics,

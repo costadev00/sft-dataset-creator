@@ -97,6 +97,7 @@ def _project_name(dataset: str) -> str:
 def _direct_config(
     *,
     dataset: str,
+    dataset_revision: str | None,
     examples: int,
     name: str | None,
     language: str,
@@ -156,6 +157,8 @@ def _direct_config(
         }
         if subset is not None:
             source_params["subset"] = subset
+        if dataset_revision is not None:
+            source_params["revision"] = dataset_revision
     elif source_plugin == "local":
         source_params = {"path": dataset}
         if source_format is not None:
@@ -351,6 +354,10 @@ def run_command(
         str | None,
         typer.Option("--dataset", help="Hugging Face dataset id or local corpus path"),
     ] = None,
+    dataset_revision: Annotated[
+        str | None,
+        typer.Option("--dataset-revision", help="Pinned Hugging Face commit, tag, or branch"),
+    ] = None,
     examples: Annotated[int | None, typer.Option("--examples", min=1, help="Final SFT example count")] = None,
     name: Annotated[str | None, typer.Option("--name", help="Project name; derived from the dataset by default")] = None,
     language: Annotated[str, typer.Option("--language")] = "en",
@@ -405,6 +412,10 @@ def run_command(
     test_split: Annotated[float, typer.Option("--test-split", min=0.0, max=1.0)] = 0.05,
     store_model_io: Annotated[bool, typer.Option("--store-model-io/--no-store-model-io")] = True,
     fail_on_partial: Annotated[bool, typer.Option("--fail-on-partial/--allow-partial")] = True,
+    smoke_models: Annotated[
+        bool,
+        typer.Option("--smoke-models", help="Load configured models and test structured output before planning"),
+    ] = False,
     plan: Annotated[Path | None, typer.Option("--plan", "-p")] = None,
     run_dir: Annotated[Path | None, typer.Option("--run-dir")] = None,
     resume: Annotated[Path | None, typer.Option("--resume", help="Existing run directory")] = None,
@@ -418,6 +429,7 @@ def run_command(
             raise typer.BadParameter("--examples is required with --dataset")
         value = _direct_config(
             dataset=dataset,
+            dataset_revision=dataset_revision,
             examples=examples,
             name=name,
             language=language,
@@ -461,8 +473,6 @@ def run_command(
             store_model_io=store_model_io,
             fail_on_partial=fail_on_partial,
         )
-        dataset_plan = build_plan(value, run_dir=run_dir)
-        root = Path(dataset_plan.corpus_snapshot).parent
     elif plan:
         dataset_plan = load_plan(plan)
         root = Path(plan).parent
@@ -471,10 +481,15 @@ def run_command(
         root = Path(resume)
         dataset_plan = load_plan(root / "plan.json")
         value = load_config(root / "config.resolved.json")
-    report = collect_doctor_report(value)
+    report = collect_doctor_report(value, smoke_models=smoke_models)
     if not report["ready"]:
         _doctor_table(report)
         raise typer.Exit(3)
+    for warning in report["warnings"]:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
+    if dataset is not None:
+        dataset_plan = build_plan(value, run_dir=run_dir)
+        root = Path(dataset_plan.corpus_snapshot).parent
     attach_environment(root, report)
     progress = Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console)
     task_id = progress.add_task("Starting run", total=None)

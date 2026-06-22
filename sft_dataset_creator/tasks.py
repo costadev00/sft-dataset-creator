@@ -42,6 +42,12 @@ CANDIDATE_SCHEMA = {
     },
 }
 
+CHAT_TEMPLATE_TOKEN_MARGIN = 128
+
+
+def _escaped_context(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
 
 def _render_context(document: Document, content_characters: int | None = None) -> str:
     remaining = content_characters
@@ -64,17 +70,28 @@ def _render_context(document: Document, content_characters: int | None = None) -
 
 def _contexts(
     documents: Sequence[Document],
-    max_tokens: int,
+    max_tokens: int | Sequence[int],
     counter_many: Callable[[Sequence[str]], list[int]],
 ) -> list[tuple[str, bool]]:
+    budgets = (
+        [max_tokens] * len(documents)
+        if isinstance(max_tokens, int)
+        else list(max_tokens)
+    )
+    if len(budgets) != len(documents):
+        raise ValueError("context token budgets must match document count")
     full = [_render_context(document) for document in documents]
     counts = counter_many(full)
     results: list[tuple[str, bool] | None] = [None] * len(documents)
     active: list[int] = []
     lows: dict[int, int] = {}
     highs: dict[int, int] = {}
-    for index, (document, text, count) in enumerate(zip(documents, full, counts, strict=True)):
-        if count <= max_tokens:
+    for index, (document, text, count, budget) in enumerate(
+        zip(documents, full, counts, budgets, strict=True)
+    ):
+        if budget <= 0:
+            raise ValueError("max_input_tokens is too small for the generation prompt")
+        if count <= budget:
             results[index] = (text, False)
             continue
         active.append(index)
@@ -90,7 +107,7 @@ def _contexts(
         probe_counts = counter_many(probes)
         next_active: list[int] = []
         for index, middle, count in zip(active, middles, probe_counts, strict=True):
-            if count <= max_tokens:
+            if count <= budgets[index]:
                 lows[index] = middle
             else:
                 highs[index] = middle - 1
@@ -123,7 +140,12 @@ class GenericTaskRecipe:
         max_input_tokens: int,
         token_counter: Callable[[str], int],
     ) -> GenerationRequest:
-        context, truncated = _context(document, max_input_tokens, token_counter)
+        overhead = token_counter(self._prompt_without_context(document, difficulty))
+        context, truncated = _context(
+            document,
+            max_input_tokens - overhead - CHAT_TEMPLATE_TOKEN_MARGIN,
+            lambda value: token_counter(_escaped_context(value)),
+        )
         return self._request(document, slot_id, difficulty, context, truncated)
 
     def build_requests(
@@ -133,25 +155,33 @@ class GenericTaskRecipe:
         max_input_tokens: int,
         token_counter_many: Callable[[Sequence[str]], list[int]],
     ) -> list[GenerationRequest]:
+        overheads = token_counter_many(
+            [
+                self._prompt_without_context(document, difficulty)
+                for document, _slot_id, difficulty in items
+            ]
+        )
         contexts = _contexts(
             [document for document, _slot_id, _difficulty in items],
-            max_input_tokens,
-            token_counter_many,
+            [
+                max_input_tokens - overhead - CHAT_TEMPLATE_TOKEN_MARGIN
+                for overhead in overheads
+            ],
+            lambda values: token_counter_many([_escaped_context(value) for value in values]),
         )
         return [
             self._request(document, slot_id, difficulty, context, truncated)
             for (document, slot_id, difficulty), (context, truncated) in zip(items, contexts, strict=True)
         ]
 
-    def _request(
+    def _user_payload(
         self,
         document: Document,
-        slot_id: str,
         difficulty: str,
         context: str,
         truncated: bool,
-    ) -> GenerationRequest:
-        user = {
+    ) -> dict[str, object]:
+        return {
             "task": self.name,
             "language": self.language,
             "difficulty": difficulty,
@@ -161,6 +191,20 @@ class GenericTaskRecipe:
             "context_truncated": truncated,
             "source_excerpt": context,
         }
+
+    def _prompt_without_context(self, document: Document, difficulty: str) -> str:
+        user = self._user_payload(document, difficulty, "", True)
+        return f"{GENERATOR_SYSTEM_PROMPT}\n{json.dumps(user, ensure_ascii=False)}"
+
+    def _request(
+        self,
+        document: Document,
+        slot_id: str,
+        difficulty: str,
+        context: str,
+        truncated: bool,
+    ) -> GenerationRequest:
+        user = self._user_payload(document, difficulty, context, truncated)
         return GenerationRequest(
             slot_id=slot_id,
             document_id=document.id,

@@ -35,16 +35,23 @@ def test_local_parquet_source(tmp_path) -> None:
 def test_huggingface_source_uses_field_mapping(monkeypatch) -> None:
     import datasets
 
+    calls = []
+
+    def load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [{"page_id": 7, "body": "Mapped Hugging Face text", "heading": "Title"}]
+
     monkeypatch.setattr(
         datasets,
         "load_dataset",
-        lambda *_args, **_kwargs: [{"page_id": 7, "body": "Mapped Hugging Face text", "heading": "Title"}],
+        load_dataset,
     )
     config = SourceConfig(
         plugin="huggingface",
-        params={"dataset": "owner/example", "split": "train"},
+        params={"dataset": "owner/example", "split": "train", "revision": "abc123"},
         field_map={"id": "page_id", "text": "body", "title": "heading"},
     )
     document = next(create("sources", "huggingface", config).iter_documents())
     assert document.id == "7"
     assert document.title == "Title"
+    assert calls[0][1]["revision"] == "abc123"

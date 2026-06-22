@@ -69,3 +69,21 @@ def test_subject_matter_use_of_context_is_not_rejected() -> None:
 
     assert result.verdict == "accept"
     assert "source_reference_in_candidate" not in result.issues
+
+
+def test_short_instruction_is_rejected() -> None:
+    document = Document(id="doc", text="A sufficiently long grounded document passage.", source="test")
+    result = deterministic_evaluation(
+        _candidate(instruction="Explain it."), document, [], EvaluationConfig()
+    )
+    assert result.verdict == "reject"
+    assert "instruction_too_short" in result.issues
+
+
+def test_exact_normalized_duplicate_is_rejected() -> None:
+    document = Document(id="doc", text="A sufficiently long grounded document passage.", source="test")
+    accepted = _candidate(id="accepted", instruction="Answer this grounded question.")
+    duplicate = _candidate(id="duplicate", instruction="  ANSWER  this grounded question. ")
+    result = deterministic_evaluation(duplicate, document, [accepted], EvaluationConfig())
+    assert result.verdict == "reject"
+    assert "duplicate_candidate" in result.issues

@@ -3,7 +3,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from sft_dataset_creator.config import CorpusSelection, ProjectConfig, load_config, save_config
+from sft_dataset_creator.config import (
+    CompositionConfig,
+    CorpusSelection,
+    EvaluationConfig,
+    ProjectConfig,
+    load_config,
+    save_config,
+)
 
 
 def test_selection_requires_exactly_one_size() -> None:
@@ -25,3 +32,10 @@ def test_config_rejects_unknown_keys(project_config) -> None:
     payload["unexpected"] = True
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(payload)
+
+
+def test_quality_gates_cannot_be_disabled() -> None:
+    with pytest.raises(ValidationError):
+        CompositionConfig(grounding_required=False)
+    with pytest.raises(ValidationError):
+        EvaluationConfig(deterministic=False)

@@ -18,7 +18,7 @@ A source emits canonical `Document` records. A task recipe converts a planned sl
 
 ## Planning
 
-Planning scans the source without calling a model. It validates unique document IDs, applies profile eligibility and configured filters, records a lightweight index, and performs seeded stratified sampling. Selected documents are split into deterministic, bounded chunks with stable numeric section IDs. Multiple slots assigned to one document iterate over those chunks in order.
+Planning scans the source without calling a model. It validates unique document IDs, applies profile eligibility and configured filters, records a lightweight index, and performs seeded stratified sampling. Hugging Face sources can be pinned to a dataset revision so both scan passes see the same repository state. Selected documents are split into deterministic, bounded chunks with stable numeric section IDs. Multiple slots assigned to one document iterate over those chunks in order.
 
 Task and difficulty weights are normalized and converted to integer quotas with largest-remainder apportionment. Slots are distributed across documents by current load, giving coverage priority before reuse. The configured reserve remains unassigned until replacement is necessary.
 
@@ -28,15 +28,15 @@ Task and difficulty weights are normalized and converted to integer quotas with 
 
 `run.db` is the transactional source of truth for slots, attempts, evaluations, and accepted canonical examples. An interrupted run resumes slots whose status is not accepted and never regenerates completed work.
 
-Execution plans attempts round-robin, capped by both the per-slot and global budgets. The generator is loaded once in an isolated spawned process. A bounded producer prepares requests in vectorized tokenizer batches while `AsyncLLM` continuously schedules GPU work. Results may complete in any order, but SQLite commits and quality decisions follow stable slot and attempt order.
+Execution proceeds in attempt rounds capped by both the per-slot and global budgets. A round generates only the currently pending slots and evaluates them before scheduling another attempt. The tokenizer and generator remain loaded between rounds unless generation and evaluation both use local vLLM models that need the same GPU memory. A bounded producer prepares requests in vectorized tokenizer batches while `AsyncLLM` continuously schedules GPU work. Results may complete in any order, but SQLite commits and quality decisions follow stable slot and attempt order.
 
-Each generation request receives one planned chunk rather than the complete document. Evidence offsets are local to that chunk and remain verifiable because the chunked corpus is stored in the immutable snapshot.
+Each generation request receives one planned chunk rather than the complete document. Its context budget subtracts the system prompt, serialized request metadata, escaped JSON content, and a chat-template safety margin from `max_input_tokens`. Evidence offsets are local to the chunk and remain verifiable because the chunked corpus is stored in the immutable snapshot.
 
-Deterministic gates validate evidence and self-contained SFT content. Duplicate detection is intentionally left to downstream processing. References to hidden source material such as "according to the text" or "cited in the document" are rejected across instruction, input, and output. The exporter repeats this gate so records accepted by older versions cannot be published. Routed candidates enter one continuous batch in a second isolated model process. Only the first accepted attempt can satisfy a slot; later generated attempts are marked `superseded` and retain their token cost as speculative work. Synchronous third-party backends and evaluators continue to run sequentially.
+Deterministic gates validate evidence offsets, minimum instruction quality, exact normalized duplicates, and self-contained SFT content. References to hidden source material such as "according to the text" or "cited in the document" are rejected across instruction, input, and output. The exporter repeats the source-reference gate so records accepted by older versions cannot be published. Routed candidates enter one continuous batch per round in a second isolated model process. Only rejected or reviewed slots advance to another attempt. Synchronous third-party backends and evaluators continue to run sequentially.
 
 The application runs as local Python processes; Docker is not part of the runtime architecture. Production model prompts are centralized in `sft_dataset_creator/prompts.py`.
 
-The first attempts use the planned document. Later attempts use reserve documents after the configured same-document retry count. Runs that exhaust the global or per-slot attempt budgets are marked `partial` and retain usable exports plus an explicit deficit report. Generated but unevaluated attempts are resumed without another model call.
+The first attempts use the planned document. Later attempts use reserve documents after the configured same-document retry count. Runs that exhaust the global or per-slot attempt budgets are marked `partial` and retain usable exports plus an explicit deficit report. Generated but unevaluated attempts are evaluated before another model call when a run resumes.
 
 ## Audit artifacts
 

@@ -63,7 +63,7 @@ def test_sequential_backend_preserves_submission_order() -> None:
     assert [result.request_id for result in results] == ["slow", "fast"]
 
 
-def test_speculative_engine_commits_attempts_deterministically(project_config, tmp_path) -> None:
+def test_iterative_engine_avoids_unnecessary_attempts(project_config, tmp_path) -> None:
     delays = {
         f"slot-{slot:08d}-a1": 0.03
         for slot in range(1, project_config.target.examples + 1)
@@ -75,11 +75,12 @@ def test_speculative_engine_commits_attempts_deterministically(project_config, t
             )
         }
     )
-    run_dir = tmp_path / "speculative"
+    run_dir = tmp_path / "iterative"
     plan = build_plan(config, run_dir)
     report = execute_plan(plan, config, run_dir=run_dir)
-    assert report.attempted_examples == 8
-    assert report.speculative_examples == 4
+    assert report.attempted_examples == 4
+    assert report.speculative_examples == 0
+    assert len(report.metrics["generation"]["rounds"]) == 1
     with RunState(run_dir / "run.db") as state:
         assert {candidate.attempt for candidate in state.accepted_candidates()} == {1}
 

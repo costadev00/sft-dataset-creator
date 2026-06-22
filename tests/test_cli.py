@@ -51,6 +51,7 @@ def test_cli_run_with_fake_backend_without_input_config(corpus_path, tmp_path) -
             "easy=1",
             "--generator-param",
             "custom=true",
+            "--smoke-models",
             "--run-dir",
             str(run_dir),
         ],

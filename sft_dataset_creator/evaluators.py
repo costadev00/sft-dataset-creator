@@ -16,7 +16,7 @@ from sft_dataset_creator.models import (
 )
 from sft_dataset_creator.prompts import JUDGE_CRITERIA, JUDGE_SYSTEM_PROMPT
 from sft_dataset_creator.registry import register
-from sft_dataset_creator.quality import candidate_source_reference
+from sft_dataset_creator.quality import candidate_fingerprint, candidate_source_reference
 
 
 JUDGE_SCHEMA = {
@@ -69,6 +69,7 @@ def deterministic_evaluation(
     document: Document,
     accepted: Iterable[SFTCandidate],
     config: EvaluationConfig,
+    accepted_fingerprints: set[str] | None = None,
 ) -> EvaluationResult:
     issues: list[str] = []
     if not candidate.instruction.strip() or not candidate.output.strip():
@@ -77,6 +78,13 @@ def deterministic_evaluation(
         issues.append("instruction_too_short")
     if candidate_source_reference(candidate.instruction, candidate.input, candidate.output):
         issues.append("source_reference_in_candidate")
+    fingerprint = candidate_fingerprint(candidate.instruction, candidate.input, candidate.output)
+    if accepted_fingerprints is None:
+        accepted_fingerprints = {
+            candidate_fingerprint(item.instruction, item.input, item.output) for item in accepted
+        }
+    if fingerprint in accepted_fingerprints:
+        issues.append("duplicate_candidate")
     snippets, evidence_issues = _evidence_text(document, candidate)
     issues.extend(evidence_issues)
     critical = {
@@ -86,6 +94,8 @@ def deterministic_evaluation(
         "evidence_quote_mismatch",
         "missing_grounding",
         "source_reference_in_candidate",
+        "instruction_too_short",
+        "duplicate_candidate",
     }
     verdict = "reject" if critical.intersection(issues) else "accept"
     return EvaluationResult(
@@ -193,6 +203,17 @@ def evaluation_from_response(
 class CompositeEvaluator:
     def __init__(self, config: EvaluationConfig) -> None:
         self.config = config
+        self._accepted_ids: set[str] = set()
+        self._accepted_fingerprints: set[str] = set()
+
+    def _sync_accepted(self, accepted: Iterable[SFTCandidate]) -> None:
+        for item in accepted:
+            if item.id in self._accepted_ids:
+                continue
+            self._accepted_ids.add(item.id)
+            self._accepted_fingerprints.add(
+                candidate_fingerprint(item.instruction, item.input, item.output)
+            )
 
     def deterministic(
         self,
@@ -200,7 +221,14 @@ class CompositeEvaluator:
         document: Document,
         accepted: Iterable[SFTCandidate],
     ) -> EvaluationResult:
-        return deterministic_evaluation(candidate, document, accepted, self.config)
+        self._sync_accepted(accepted)
+        return deterministic_evaluation(
+            candidate,
+            document,
+            accepted,
+            self.config,
+            accepted_fingerprints=self._accepted_fingerprints,
+        )
 
     def should_route(self, candidate: SFTCandidate, evaluation: EvaluationResult, seed: int) -> bool:
         return should_route_to_llm(candidate, evaluation, self.config, seed)

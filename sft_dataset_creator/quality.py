@@ -55,3 +55,8 @@ def candidate_source_reference(*values: str) -> str | None:
         if match:
             return match
     return None
+
+
+def candidate_fingerprint(*values: str) -> str:
+    """Return a stable normalized representation of user-facing SFT content."""
+    return "\x1f".join(_normalize(value) for value in values)

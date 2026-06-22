@@ -48,7 +48,10 @@ sft-dataset run \
   --examples 1000 \
   --language pt-BR \
   --id-field __row_index__ \
+  --dataset-revision DATASET_COMMIT_SHA \
+  --profile wikipedia_ptbr \
   --generator-param tensor_parallel_size=4 \
+  --smoke-models \
   --run-dir runs/wiki-brazil
 ```
 
@@ -87,6 +90,8 @@ sft-dataset publish runs/<run-id> --repo-id owner/dataset
 
 Every run writes `config.resolved.json`. This is an output artifact used for hashing, auditing, export, and resume; users do not need to create it.
 
+`--smoke-models` is intentionally opt-in because it loads configured checkpoints. Environment and dependency checks run before the dataset scan; the smoke request additionally validates model loading and structured JSON output.
+
 ## Built-in integrations
 
 - Sources: Hugging Face Datasets and local JSON, JSONL, or Parquet.
@@ -116,6 +121,15 @@ Selective LLM evaluation is enabled by passing a judge model:
 --judge-param tensor_parallel_size=4 \
 --judge-param quantization=compressed-tensors
 ```
+
+For maximum semantic-quality coverage, route every deterministically valid candidate to the judge:
+
+```bash
+--judge-model google/gemma-4-31B-it-qat-w4a16-ct \
+--audit-fraction 1.0
+```
+
+Without `--judge-model`, the pipeline still enforces schema, evidence offsets, self-contained wording, minimum instruction quality, and exact-duplicate gates, but it cannot prove that the answer is semantically entailed by the cited evidence. The CLI emits a warning for this mode.
 
 Generation and evaluation run in separate spawned processes so the first model releases GPU memory before the second is loaded. Inside each process, vLLM `AsyncLLM` receives a bounded stream of concurrent requests and performs continuous batching. Prefix caching and chunked prefill are enabled by the flags above.
 

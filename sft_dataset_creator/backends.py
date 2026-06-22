@@ -93,7 +93,9 @@ class FakeBackend:
         return float(delays.get(request.request_id, 0.0)) if isinstance(delays, dict) else 0.0
 
     def _response(self, request: GenerationRequest) -> BackendResponse:
-        if request.task == "judge":
+        if request.task == "doctor":
+            payload = {"ok": True}
+        elif request.task == "judge":
             payload = {
                 "verdict": "accept",
                 "overall_score": 4.8,
