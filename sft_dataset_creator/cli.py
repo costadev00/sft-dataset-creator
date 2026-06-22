@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -35,6 +37,9 @@ from sft_dataset_creator.prompts import TASK_INSTRUCTIONS
 from sft_dataset_creator.registry import available_plugins
 from sft_dataset_creator.state import RunState
 from sft_dataset_creator.tuning import tune_project
+
+
+load_dotenv(Path(".env"))
 
 
 app = typer.Typer(
@@ -82,6 +87,37 @@ def _weights(values: list[str], defaults: dict[str, float], option: str) -> dict
         except ValueError as exc:
             raise typer.BadParameter(f"{option} weights must be numeric: {value}") from exc
     return parsed
+
+
+def _model_params(
+    values: list[str],
+    option: str,
+    *,
+    plugin: str,
+    model: str,
+    cache_dir: Path,
+) -> dict[str, Any]:
+    params = _key_values(values, option)
+    if plugin != "vllm_local":
+        return params
+    params.setdefault("download_dir", str((cache_dir / "models").resolve()))
+    if "gemma-4" in model.casefold():
+        params.setdefault("max_num_batched_tokens", 16_384)
+    return params
+
+
+def _configure_cache_environment(cache_dir: Path) -> None:
+    root = cache_dir.expanduser().resolve()
+    huggingface = root / "huggingface"
+    values = {
+        "HF_HOME": huggingface,
+        "HF_HUB_CACHE": huggingface / "hub",
+        "HF_XET_CACHE": huggingface / "xet",
+        "TRANSFORMERS_CACHE": huggingface / "transformers",
+    }
+    for key, path in values.items():
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ[key] = str(path)
 
 
 def _csv(value: str) -> list[str]:
@@ -143,6 +179,10 @@ def _direct_config(
 ) -> ProjectConfig:
     if document_count is not None and selection_fraction is not None:
         raise typer.BadParameter("use only one of --documents or --selection-fraction")
+    if dataset_revision and dataset_revision.strip().upper() == "DATASET_COMMIT_SHA":
+        raise typer.BadParameter(
+            "replace DATASET_COMMIT_SHA with a real Hugging Face revision or omit --dataset-revision"
+        )
     selection = (
         CorpusSelection(count=document_count, seed=seed)
         if document_count is not None
@@ -166,10 +206,17 @@ def _direct_config(
     else:
         raise typer.BadParameter("--source must be 'huggingface' or 'local'")
 
+    generation_params = _model_params(
+        generator_params,
+        "--generator-param",
+        plugin=generator_plugin,
+        model=model,
+        cache_dir=cache_dir,
+    )
     generation = GenerationConfig(
         plugin=generator_plugin,
         model=model,
-        params=_key_values(generator_params, "--generator-param"),
+        params=generation_params,
     )
     task_weights = _weights(task_values, DEFAULT_TASKS, "--task")
     unknown_tasks = sorted(set(task_weights) - set(TASK_INSTRUCTIONS))
@@ -177,10 +224,17 @@ def _direct_config(
         raise typer.BadParameter(f"unknown --task value(s): {', '.join(unknown_tasks)}")
     llm = None
     if judge_model is not None:
+        resolved_judge_plugin = judge_plugin or generator_plugin
         llm = GenerationConfig(
-            plugin=judge_plugin or generator_plugin,
+            plugin=resolved_judge_plugin,
             model=judge_model,
-            params=_key_values(judge_params, "--judge-param"),
+            params=_model_params(
+                judge_params,
+                "--judge-param",
+                plugin=resolved_judge_plugin,
+                model=judge_model,
+                cache_dir=cache_dir,
+            ),
         )
     return ProjectConfig(
         name=name or _project_name(dataset),
@@ -289,6 +343,8 @@ def doctor(
 ) -> None:
     """Inspect plugins, storage, GPUs, dependencies, and optionally model loading."""
     value = load_config(config) if config else None
+    if value is not None:
+        _configure_cache_environment(value.runtime.cache_dir)
     report = collect_doctor_report(value, smoke_models=smoke_models)
     _doctor_table(report)
     if not report["ready"]:
@@ -306,6 +362,7 @@ def tune_command(
     if stage not in {"generation", "evaluation", "both"}:
         raise typer.BadParameter("--stage must be generation, evaluation, or both")
     value = load_config(config)
+    _configure_cache_environment(value.runtime.cache_dir)
     tuned, report_path = tune_project(value, output, stage=stage, samples=samples)
     table = Table(title="Selected batching profiles")
     table.add_column("Stage")
@@ -330,6 +387,7 @@ def plan_command(
 ) -> None:
     """Scan the corpus and create an immutable execution plan."""
     value = load_config(config)
+    _configure_cache_environment(value.runtime.cache_dir)
     with console.status("Scanning source and allocating slots..."):
         plan = build_plan(value, run_dir=run_dir)
     root = Path(plan.corpus_snapshot).parent
@@ -481,6 +539,7 @@ def run_command(
         root = Path(resume)
         dataset_plan = load_plan(root / "plan.json")
         value = load_config(root / "config.resolved.json")
+    _configure_cache_environment(value.runtime.cache_dir)
     report = collect_doctor_report(value, smoke_models=smoke_models)
     if not report["ready"]:
         _doctor_table(report)

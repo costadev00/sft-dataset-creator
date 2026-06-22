@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 
 from typer.testing import CliRunner
 
-from sft_dataset_creator.cli import app
+from sft_dataset_creator.cli import _configure_cache_environment, _model_params, app
 from sft_dataset_creator.config import save_config
 
 
@@ -25,6 +26,40 @@ def test_cli_plugins() -> None:
     result = runner.invoke(app, ["plugins"])
     assert result.exit_code == 0, result.output
     assert "vllm_local" in result.output
+
+
+def test_gemma_vllm_defaults_use_safe_batch_and_project_cache(tmp_path) -> None:
+    params = _model_params(
+        [],
+        "--generator-param",
+        plugin="vllm_local",
+        model="google/gemma-4-26B-A4B-it",
+        cache_dir=tmp_path,
+    )
+    assert params["max_num_batched_tokens"] == 16_384
+    assert params["download_dir"] == str((tmp_path / "models").resolve())
+
+
+def test_explicit_gemma_vllm_batch_size_wins(tmp_path) -> None:
+    params = _model_params(
+        ["max_num_batched_tokens=8192"],
+        "--generator-param",
+        plugin="vllm_local",
+        model="google/gemma-4-26B-A4B-it",
+        cache_dir=tmp_path,
+    )
+    assert params["max_num_batched_tokens"] == 8_192
+
+
+def test_cli_cache_overrides_stale_huggingface_environment(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HF_HOME", "/stale/unwritable/cache")
+    _configure_cache_environment(tmp_path)
+    assert os.environ["HF_HOME"] == str((tmp_path / "huggingface").resolve())
+    assert os.environ["HF_HUB_CACHE"] == str((tmp_path / "huggingface" / "hub").resolve())
+    assert os.environ["HF_XET_CACHE"] == str((tmp_path / "huggingface" / "xet").resolve())
+    assert os.environ["TRANSFORMERS_CACHE"] == str(
+        (tmp_path / "huggingface" / "transformers").resolve()
+    )
 
 
 def test_cli_run_with_fake_backend_without_input_config(corpus_path, tmp_path) -> None:
@@ -72,6 +107,25 @@ def test_cli_run_requires_examples_with_dataset(corpus_path) -> None:
     result = runner.invoke(app, ["run", "--dataset", str(corpus_path), "--source", "local"])
     assert result.exit_code != 0
     assert "--examples is required with --dataset" in result.output
+
+
+def test_cli_run_rejects_dataset_revision_placeholder(corpus_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--dataset",
+            str(corpus_path),
+            "--source",
+            "local",
+            "--dataset-revision",
+            "DATASET_COMMIT_SHA",
+            "--examples",
+            "2",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "replace DATASET_COMMIT_SHA" in result.output
 
 
 def test_cli_run_rejects_multiple_selection_sizes(corpus_path) -> None:

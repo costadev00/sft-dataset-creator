@@ -48,7 +48,6 @@ sft-dataset run \
   --examples 1000 \
   --language pt-BR \
   --id-field __row_index__ \
-  --dataset-revision DATASET_COMMIT_SHA \
   --profile wikipedia_ptbr \
   --generator-param tensor_parallel_size=4 \
   --smoke-models \
@@ -56,6 +55,8 @@ sft-dataset run \
 ```
 
 `huggingface`, `train`, streaming mode, the Gemma generator, the built-in task mix, and JSONL exports are defaults. Use `sft-dataset run --help` for all source, selection, model, retry, evaluation, and output options.
+
+For reproducible production runs, pass a real Hugging Face commit SHA with `--dataset-revision`. Omit the option for quick smoke tests; placeholder values are rejected.
 
 Local JSON, JSONL, and Parquet corpora use the same command:
 
