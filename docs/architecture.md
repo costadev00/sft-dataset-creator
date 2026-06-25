@@ -1,12 +1,32 @@
-# Architecture
+# Arquitetura
 
-## Public contracts
+Este documento descreve como o `sft-dataset-creator` organiza uma run de SFT.
+Para comandos por tipo de maquina, veja [running.md](running.md).
 
-The public Python surface consists of `ProjectConfig`, `BatchingConfig`, `BatchGenerationResult`, `load_config`, `build_plan`, `execute_plan`, `tune_project`, `export_run`, and `publish_run`. Core records use Pydantic and reject unknown fields.
+## Contratos publicos
 
-The `run` CLI builds `ProjectConfig` directly from typed command-line options. The resolved model is persisted as `config.resolved.json`; it is an execution artifact rather than a required user input.
+A superficie Python principal e composta por:
 
-Extension points are Python Protocols discovered through these entry-point groups:
+- `ProjectConfig`
+- `BatchingConfig`
+- `BatchGenerationResult`
+- `load_config`
+- `build_plan`
+- `execute_plan`
+- `tune_project`
+- `export_run`
+- `publish_run`
+
+Os registros sao modelos Pydantic estritos. Chaves desconhecidas falham cedo,
+antes de qualquer chamada a modelo.
+
+A CLI `sft-dataset run` monta um `ProjectConfig` diretamente a partir das
+opcoes de linha de comando. O arquivo `config.resolved.json` e um artefato de
+execucao, nao um arquivo que o usuario precise escrever manualmente.
+
+## Extensoes
+
+Os pontos de extensao sao entry points Python:
 
 - `sft_dataset_creator.sources`
 - `sft_dataset_creator.tasks`
@@ -14,45 +34,233 @@ Extension points are Python Protocols discovered through these entry-point group
 - `sft_dataset_creator.evaluators`
 - `sft_dataset_creator.exporters`
 
-A source emits canonical `Document` records. A task recipe converts a planned slot and document into a `GenerationRequest`. A backend returns structured JSON. Backends may additionally implement batch generation and vectorized token counting; the engine detects those capabilities and falls back to the synchronous contract. Evaluators operate on canonical `SFTCandidate` records. Exporters are views over accepted candidates rather than separate generation pipelines.
+Um source emite `Document`. Uma task transforma um slot planejado e um documento
+em `GenerationRequest`. Um backend retorna JSON estruturado. Um evaluator opera
+sobre `SFTCandidate`. Um exporter converte exemplos aceitos para uma visao final
+do dataset.
 
-## Planning
+## Backends
 
-Planning scans the source without calling a model. It validates unique document IDs, applies profile eligibility and configured filters, records a lightweight index, and performs seeded stratified sampling. Hugging Face sources can be pinned to a dataset revision so both scan passes see the same repository state. Selected documents are split into deterministic, bounded chunks with stable numeric section IDs. Multiple slots assigned to one document iterate over those chunks in order.
+Backends inclusos:
 
-Task and difficulty weights are normalized and converted to integer quotas with largest-remainder apportionment. Slots are distributed across documents by current load, giving coverage priority before reuse. The configured reserve remains unassigned until replacement is necessary.
+| Backend | Uso | Observacao |
+| --- | --- | --- |
+| `fake` | testes CPU/CI | nao chama LLM real |
+| `openai_compatible` | API externa | usa chat completions HTTP |
+| `vllm_local` | GPU local | usa vLLM em subprocesso isolado |
 
-`plan.json` is immutable and tied to `config.resolved.json` by SHA-256. The selected document bodies are stored separately in `corpus-selected.jsonl` so execution does not depend on the source remaining unchanged.
+O backend local com vLLM encaminha parametros via `--generator-param`, incluindo:
 
-## Execution and recovery
+- `tensor_parallel_size`
+- `gpu_memory_utilization`
+- `quantization`
+- `kv_cache_dtype`
+- `max_num_seqs`
+- `max_num_batched_tokens`
+- `enable_chunked_prefill`
+- `enable_prefix_caching`
+- `download_dir`
+- `kv_cache_memory_bytes`
+- `cpu_offload_gb`
 
-`run.db` is the transactional source of truth for slots, attempts, evaluations, and accepted canonical examples. An interrupted run resumes slots whose status is not accepted and never regenerates completed work.
-
-Execution proceeds in attempt rounds capped by both the per-slot and global budgets. A round generates only the currently pending slots and evaluates them before scheduling another attempt. The tokenizer and generator remain loaded between rounds. A bounded producer prepares requests in vectorized tokenizer batches while `AsyncLLM` continuously schedules GPU work. Results may complete in any order, but SQLite commits and quality decisions follow stable slot and attempt order.
-
-Each generation request receives one planned chunk rather than the complete document. Its context budget subtracts the system prompt, serialized request metadata, escaped JSON content, and a chat-template safety margin from `max_input_tokens`. Evidence offsets are local to the chunk and remain verifiable because the chunked corpus is stored in the immutable snapshot.
-
-Deterministic gates validate evidence offsets, minimum instruction quality, exact normalized duplicates, and self-contained SFT content. References to hidden source material such as "according to the text" or "cited in the document" are rejected across instruction, input, and output. The exporter repeats the source-reference gate so records accepted by older versions cannot be published. Only rejected or reviewed slots advance to another attempt. Synchronous third-party backends continue to run sequentially.
-
-The application runs as local Python processes; Docker is not part of the runtime architecture. Production model prompts are centralized in `sft_dataset_creator/prompts.py`.
-
-The first attempts use the planned document. Later attempts use reserve documents after the configured same-document retry count. Runs that exhaust the global or per-slot attempt budgets are marked `partial` and retain usable exports plus an explicit deficit report. Generated but unevaluated attempts are evaluated before another model call when a run resumes.
-
-## Audit artifacts
-
-Each run directory contains:
+Para o modelo padrao `google/gemma-4-31B-it-qat-w4a16-ct`, a CLI aplica:
 
 ```text
-config.resolved.json
-manifest.json
-plan.json
-corpus-index.jsonl
-corpus-selected.jsonl
-run.db
-report.json
-exports/
+tensor_parallel_size=4
+quantization=compressed-tensors
+kv_cache_dtype=fp8
+max_num_batched_tokens=16384
+download_dir=<cache>/models
 ```
 
-The manifest records hardware, installed plugins, package availability, models, and configuration hashes. Final exports retain document IDs, task metadata, evidence spans, and model provenance. Hidden reasoning and secrets are never persisted.
+Esse e o perfil principal para a maquina 4x RTX 4000 Ada.
 
-`audit-sample` creates a blinded sample balanced across task and difficulty. The system decisions are written to a separate key. After human labels are added, `audit-score` reports human acceptance and recall over human-rejected candidates.
+## Planejamento
+
+O planejamento nao chama modelo. Ele:
+
+1. carrega a fonte Hugging Face ou local;
+2. normaliza registros em `Document`;
+3. aplica filtros de perfil, por exemplo `wikipedia_ptbr`;
+4. valida IDs unicos;
+5. seleciona documentos por contagem ou fracao;
+6. cria chunks deterministico de texto;
+7. distribui tarefas e dificuldades;
+8. grava `plan.json`, `corpus-index.jsonl` e `corpus-selected.jsonl`.
+
+`plan.json` e amarrado a `config.resolved.json` por SHA-256. A execucao rejeita
+um plano se a config resolvida nao bater com o hash do plano.
+
+## Chunking
+
+Cada request de geracao recebe um chunk planejado, nao o documento inteiro. Isso
+controla custo de contexto e mantem offsets de evidencia verificaveis.
+
+Parametros relevantes:
+
+- `--chunk-size`, default `8000`
+- `--chunk-overlap`, default `400`
+
+Se uma run precisa reduzir memoria ou latencia, diminuir `--chunk-size` costuma
+ser mais seguro do que alterar prompt ou schema.
+
+## Execucao
+
+`run.db` e a fonte transacional da verdade. Ele guarda slots, tentativas,
+respostas, avaliacoes e exemplos aceitos.
+
+O motor executa rodadas:
+
+1. identifica slots pendentes;
+2. monta requests da rodada;
+3. envia requests ao backend de geracao;
+4. grava candidatos gerados;
+5. aplica avaliacao deterministica;
+6. aceita, rejeita ou marca para nova tentativa;
+7. repete ate atingir a meta ou esgotar limites.
+
+Em vLLM local, o gerador fica carregado entre rodadas. Nao ha segundo modelo de
+avaliacao, portanto nao ha troca de checkpoint na GPU.
+
+## Avaliacao deterministica
+
+O fluxo atual removeu judge LLM. A avaliacao e sempre automatica e
+deterministica.
+
+Gates principais:
+
+- instrucao e resposta nao vazias;
+- tamanho minimo de instrucao;
+- evidencia presente;
+- offsets de evidencia validos;
+- quote consistente quando fornecida;
+- rejeicao de referencias ao texto oculto, como "de acordo com o texto";
+- rejeicao de duplicatas normalizadas;
+- validacao final no exporter para impedir vazamento de fonte oculta.
+
+Campos legados ainda existem para compatibilidade:
+
+- `EvaluationConfig.llm`
+- `RoutingConfig`
+- `AcceptanceConfig`
+- `llm_judged_examples`
+- `llm_judge_coverage`
+- `semantic_judge_configured`
+
+Mesmo se uma config antiga contiver `evaluation.llm`, o engine ignora esse campo.
+Os relatorios novos devem indicar `llm_judged_examples=0` e
+`semantic_judge_configured=false`.
+
+## Retomada
+
+Uma run interrompida pode ser retomada com:
+
+```bash
+sft-dataset run --resume runs/<run-id>
+```
+
+Na retomada, tentativas ja geradas e ainda nao avaliadas sao avaliadas antes de
+novas chamadas de geracao. Slots aceitos nao sao regenerados.
+
+## Limites e parciais
+
+Os limites principais sao:
+
+- `--max-attempts`, tentativas por slot;
+- `--attempt-multiplier`, limite global de tentativas;
+- `--reserve-fraction`, documentos extras para substituicao;
+- `--same-document-attempts`, quantas tentativas usam o documento original antes
+  de recorrer a reserva.
+
+Se a meta nao for atingida, a run termina como `partial`. Os artefatos continuam
+uteis para diagnostico, mas publicacao direta e bloqueada pela CLI.
+
+## Exports
+
+Views inclusas:
+
+- `messages`
+- `prompt_completion`
+- `alpaca`
+
+Container padrao:
+
+- `jsonl`
+
+Splits padrao:
+
+```text
+train=1.0
+validation=0.0
+test=0.0
+```
+
+O exporter remove arquivos stale de splits desabilitados e grava
+`generation_info.json` com gerador, evaluator deterministico e hash da config.
+
+## Auditoria manual
+
+`audit-sample` cria uma amostra cega de exemplos avaliados pelo sistema.
+`audit-score` compara os rotulos humanos com as decisoes deterministicas.
+
+O campo `llm_route_rate` pode aparecer no relatorio de auditoria por
+compatibilidade, mas no fluxo atual deve permanecer em zero.
+
+## Doctor e smoke
+
+`collect_doctor_report` verifica:
+
+- versao Python e plataforma;
+- GPUs via `nvidia-smi`;
+- plugins disponiveis;
+- pacotes instalados;
+- permissao de escrita em caminhos;
+- compatibilidade basica entre `tensor_parallel_size` e GPUs detectadas.
+
+Com `--smoke-models`, a CLI carrega apenas o gerador configurado e solicita uma
+resposta JSON minima. Isso valida o caminho de modelo sem iniciar uma run grande.
+
+## Tuning
+
+`tune_project` otimiza somente a etapa de geracao. Ele compara perfis sequencial
+e async, ajustando parametros como:
+
+- `max_num_seqs`
+- `max_num_batched_tokens`
+- `gpu_memory_utilization`
+- `enable_chunked_prefill`
+- `enable_prefix_caching`
+
+Como tuning carrega o modelo e executa requests reais, deve ser usado na maquina
+alvo.
+
+## Estrutura de uma run
+
+```text
+runs/<run-id>/
+  config.resolved.json
+  manifest.json
+  plan.json
+  corpus-index.jsonl
+  corpus-selected.jsonl
+  run.db
+  report.json
+  exports/
+    messages/train.jsonl
+    prompt_completion/train.jsonl
+    alpaca/train.jsonl
+```
+
+`manifest.json` registra ambiente, plugins, pacotes e GPUs. `report.json`
+resume status, contagens, metricas de geracao, tokens e deficits.
+
+## Sequencia recomendada
+
+1. Validar o pipeline com backend `fake`.
+2. Rodar smoke real com `--smoke-models`.
+3. Rodar uma amostra intermediaria.
+4. Inspecionar exemplos aceitos.
+5. Ajustar prompts, composicao ou parametros de batching.
+6. Rodar a meta final.
+7. Criar auditoria manual.
+8. Publicar somente depois de revisao.

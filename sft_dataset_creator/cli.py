@@ -524,7 +524,7 @@ def run_command(
         if kind == "generation_started":
             progress.update(task_id, description=f"Generating round {payload['round']} ({payload['slots']} slots)")
         elif kind == "evaluation_started":
-            progress.update(task_id, description=f"Evaluating {payload['candidates']} routed candidates")
+            progress.update(task_id, description=f"Evaluating {payload['candidates']} candidates")
         elif kind == "round_finished":
             progress.update(task_id, description=f"Round {payload['round']}: {payload['accepted']}/{payload['target']} accepted")
 
