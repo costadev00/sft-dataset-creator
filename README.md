@@ -9,7 +9,6 @@ The framework is source-agnostic and model-agnostic. A run is declared directly 
 ```text
 source scan -> deterministic plan -> continuous batched generation
             -> iterative document chunks -> quality gates
-            -> batched selective LLM evaluation
             -> grouped splits -> exports -> optional Hub publication
 ```
 
@@ -34,7 +33,7 @@ Local vLLM models run in isolated subprocesses on the configured GPUs.
 
 ## Editing prompts
 
-All prompts sent to generation, judge, and model smoke-test requests are kept in
+All prompts sent to generation and model smoke-test requests are kept in
 [sft_dataset_creator/prompts.py](sft_dataset_creator/prompts.py). Edit that file
 to change model behavior without navigating execution or backend code.
 
@@ -54,7 +53,7 @@ sft-dataset run \
   --run-dir runs/wiki-brazil
 ```
 
-`huggingface`, `train`, streaming mode, the Gemma generator, the built-in task mix, and JSONL exports are defaults. Use `sft-dataset run --help` for all source, selection, model, retry, evaluation, and output options.
+`huggingface`, source split `train`, streaming mode, the Gemma 31B QAT generator, deterministic-only evaluation, JSONL exports, and train-only output exports are defaults. Use `sft-dataset run --help` for all source, selection, model, retry, and output options.
 
 For reproducible production runs, pass a real Hugging Face commit SHA with `--dataset-revision`. Omit the option for quick smoke tests; placeholder values are rejected.
 
@@ -74,7 +73,7 @@ Repeat weighted options and backend parameters as needed:
 ```bash
 --task closed_qa=0.6 --task summarization=0.4
 --difficulty easy=0.25 --difficulty medium=0.5 --difficulty hard=0.25
---generator-param tensor_parallel_size=4 --generator-param dtype=bfloat16
+--generator-param max_num_seqs=16 --generator-param enable_prefix_caching=true
 ```
 
 Run management remains non-interactive and automation-safe:
@@ -98,41 +97,27 @@ Every run writes `config.resolved.json`. This is an output artifact used for has
 - Sources: Hugging Face Datasets and local JSON, JSONL, or Parquet.
 - Backends: isolated local vLLM, OpenAI-compatible HTTP, and a deterministic fake backend.
 - Tasks: question answering, summarization, extraction, classification, explanations, fact checking, timelines, rewrites, and related SFT recipes.
-- Evaluation: deterministic schema, evidence, and self-contained-content gates plus selective LLM judging.
+- Evaluation: deterministic schema, evidence, and self-contained-content gates.
 - Outputs: chat messages, prompt/completion, and Alpaca views in JSONL or Parquet.
 - Publication: generic private-by-default Hugging Face Hub upload.
 
 Third-party packages can register sources, task recipes, backends, evaluators, and exporters through Python entry points. See [the architecture guide](docs/architecture.md).
 
-## Local GPU example
+## Local GPU Example
 
-The default generator is `google/gemma-4-26B-A4B-it`. A four-GPU run can add:
-
-```bash
---generator-param tensor_parallel_size=4 \
---generator-param dtype=bfloat16 \
---generator-param enable_chunked_prefill=true \
---generator-param enable_prefix_caching=true
-```
-
-Selective LLM evaluation is enabled by passing a judge model:
+The default generator is `google/gemma-4-31B-it-qat-w4a16-ct`. For local vLLM runs, the CLI automatically applies the 31B QAT defaults:
 
 ```bash
---judge-model google/gemma-4-31B-it-qat-w4a16-ct \
---judge-param tensor_parallel_size=4 \
---judge-param quantization=compressed-tensors
+tensor_parallel_size=4
+quantization=compressed-tensors
+kv_cache_dtype=fp8
+max_num_batched_tokens=16384
+download_dir=<cache>/models
 ```
 
-For maximum semantic-quality coverage, route every deterministically valid candidate to the judge:
+Use `--smoke-models` before large runs to validate that the configured generator loads and returns structured JSON on the target machine. Evaluation is automatic and deterministic; there is no judge model or GPU model swap.
 
-```bash
---judge-model google/gemma-4-31B-it-qat-w4a16-ct \
---audit-fraction 1.0
-```
-
-Without `--judge-model`, the pipeline still enforces schema, evidence offsets, self-contained wording, minimum instruction quality, and exact-duplicate gates, but it cannot prove that the answer is semantically entailed by the cited evidence. The CLI emits a warning for this mode.
-
-Generation and evaluation run in separate spawned processes so the first model releases GPU memory before the second is loaded. Inside each process, vLLM `AsyncLLM` receives a bounded stream of concurrent requests and performs continuous batching. Prefix caching and chunked prefill are enabled by the flags above.
+Inside the generator process, vLLM `AsyncLLM` receives a bounded stream of concurrent requests and performs continuous batching. You can still add generation backend parameters with repeated `--generator-param KEY=VALUE` options when you need to override the defaults.
 
 Documents are split into bounded, overlapping character chunks during planning.
 When a document receives multiple examples, its slots iterate over chunk IDs in

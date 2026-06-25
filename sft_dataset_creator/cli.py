@@ -50,7 +50,7 @@ app = typer.Typer(
 console = Console()
 
 
-DEFAULT_MODEL = "google/gemma-4-26B-A4B-it"
+DEFAULT_MODEL = "google/gemma-4-31B-it-qat-w4a16-ct"
 DEFAULT_TASKS = {
     "closed_qa": 0.25,
     "summarization": 0.20,
@@ -101,8 +101,13 @@ def _model_params(
     if plugin != "vllm_local":
         return params
     params.setdefault("download_dir", str((cache_dir / "models").resolve()))
-    if "gemma-4" in model.casefold():
+    model_name = model.casefold()
+    if "gemma-4" in model_name:
         params.setdefault("max_num_batched_tokens", 16_384)
+    if "gemma-4-31b" in model_name and "qat-w4a16-ct" in model_name:
+        params.setdefault("tensor_parallel_size", 4)
+        params.setdefault("quantization", "compressed-tensors")
+        params.setdefault("kv_cache_dtype", "fp8")
     return params
 
 
@@ -165,10 +170,6 @@ def _direct_config(
     generator_plugin: str,
     model: str,
     generator_params: list[str],
-    judge_model: str | None,
-    judge_plugin: str | None,
-    judge_params: list[str],
-    audit_fraction: float,
     formats: str,
     containers: str,
     train_split: float,
@@ -222,20 +223,6 @@ def _direct_config(
     unknown_tasks = sorted(set(task_weights) - set(TASK_INSTRUCTIONS))
     if unknown_tasks:
         raise typer.BadParameter(f"unknown --task value(s): {', '.join(unknown_tasks)}")
-    llm = None
-    if judge_model is not None:
-        resolved_judge_plugin = judge_plugin or generator_plugin
-        llm = GenerationConfig(
-            plugin=resolved_judge_plugin,
-            model=judge_model,
-            params=_model_params(
-                judge_params,
-                "--judge-param",
-                plugin=resolved_judge_plugin,
-                model=judge_model,
-                cache_dir=cache_dir,
-            ),
-        )
     return ProjectConfig(
         name=name or _project_name(dataset),
         language=language,
@@ -269,10 +256,7 @@ def _direct_config(
             ),
         ),
         generation=generation,
-        evaluation=EvaluationConfig(
-            llm=llm,
-            routing={"audit_fraction": audit_fraction},
-        ),
+        evaluation=EvaluationConfig(),
         output=OutputConfig(
             formats=_csv(formats),
             containers=_csv(containers),
@@ -355,12 +339,12 @@ def doctor(
 def tune_command(
     config: Annotated[Path, typer.Option("--config", "-c")],
     output: Annotated[Path, typer.Option("--output", "-o")] = Path("sft-project.tuned.json"),
-    stage: Annotated[str, typer.Option("--stage", help="generation, evaluation, or both")] = "both",
+    stage: Annotated[str, typer.Option("--stage", help="generation")] = "generation",
     samples: Annotated[int, typer.Option("--samples", min=2)] = 32,
 ) -> None:
     """Benchmark serial and async profiles and write a reproducible tuned configuration."""
-    if stage not in {"generation", "evaluation", "both"}:
-        raise typer.BadParameter("--stage must be generation, evaluation, or both")
+    if stage != "generation":
+        raise typer.BadParameter("--stage must be generation")
     value = load_config(config)
     _configure_cache_environment(value.runtime.cache_dir)
     tuned, report_path = tune_project(value, output, stage=stage, samples=samples)
@@ -369,12 +353,6 @@ def tune_command(
     table.add_column("Mode")
     table.add_column("Inflight")
     table.add_row("generation", tuned.generation.batching.mode, str(tuned.generation.batching.max_inflight_requests))
-    if tuned.evaluation.llm is not None:
-        table.add_row(
-            "evaluation",
-            tuned.evaluation.llm.batching.mode,
-            str(tuned.evaluation.llm.batching.max_inflight_requests),
-        )
     console.print(table)
     console.print(f"[green]Tuned configuration:[/green] {output}")
     console.print(f"[green]Benchmark report:[/green] {report_path}")
@@ -456,18 +434,11 @@ def run_command(
         list[str],
         typer.Option("--generator-param", help="Repeat backend-specific KEY=VALUE"),
     ] = [],
-    judge_model: Annotated[str | None, typer.Option("--judge-model", help="Enable selective LLM evaluation")] = None,
-    judge_plugin: Annotated[str | None, typer.Option("--judge-plugin")] = None,
-    judge_params: Annotated[
-        list[str],
-        typer.Option("--judge-param", help="Repeat judge backend KEY=VALUE"),
-    ] = [],
-    audit_fraction: Annotated[float, typer.Option("--audit-fraction", min=0.0, max=1.0)] = 0.10,
     formats: Annotated[str, typer.Option("--formats", help="Comma-separated output views")] = "messages,prompt_completion,alpaca",
     containers: Annotated[str, typer.Option("--containers", help="Comma-separated jsonl/parquet containers")] = "jsonl",
-    train_split: Annotated[float, typer.Option("--train-split", min=0.0, max=1.0)] = 0.90,
-    validation_split: Annotated[float, typer.Option("--validation-split", min=0.0, max=1.0)] = 0.05,
-    test_split: Annotated[float, typer.Option("--test-split", min=0.0, max=1.0)] = 0.05,
+    train_split: Annotated[float, typer.Option("--train-split", min=0.0, max=1.0)] = 1.0,
+    validation_split: Annotated[float, typer.Option("--validation-split", min=0.0, max=1.0)] = 0.0,
+    test_split: Annotated[float, typer.Option("--test-split", min=0.0, max=1.0)] = 0.0,
     store_model_io: Annotated[bool, typer.Option("--store-model-io/--no-store-model-io")] = True,
     fail_on_partial: Annotated[bool, typer.Option("--fail-on-partial/--allow-partial")] = True,
     smoke_models: Annotated[
@@ -519,10 +490,6 @@ def run_command(
             generator_plugin=generator_plugin,
             model=model,
             generator_params=generator_params,
-            judge_model=judge_model,
-            judge_plugin=judge_plugin,
-            judge_params=judge_params,
-            audit_fraction=audit_fraction,
             formats=formats,
             containers=containers,
             train_split=train_split,
@@ -623,7 +590,7 @@ def audit_sample_command(
 
 @app.command("audit-score")
 def audit_score_command(run_dir: Annotated[Path, typer.Argument()]) -> None:
-    """Score a completed manual audit against gates and selective LLM routing."""
+    """Score a completed manual audit against deterministic gates."""
     report = score_audit(run_dir)
     console.print(Panel.fit(json.dumps(report, indent=2), title="Audit report"))
 

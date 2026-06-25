@@ -5,7 +5,7 @@ import os
 
 from typer.testing import CliRunner
 
-from sft_dataset_creator.cli import _configure_cache_environment, _model_params, app
+from sft_dataset_creator.cli import DEFAULT_MODEL, _configure_cache_environment, _model_params, app
 from sft_dataset_creator.config import save_config
 
 
@@ -28,14 +28,25 @@ def test_cli_plugins() -> None:
     assert "vllm_local" in result.output
 
 
-def test_gemma_vllm_defaults_use_safe_batch_and_project_cache(tmp_path) -> None:
+def test_cli_run_help_has_no_judge_options() -> None:
+    result = runner.invoke(app, ["run", "--help"])
+    assert result.exit_code == 0, result.output
+    for option in ("judge-model", "judge-plugin", "judge-param", "audit-fraction"):
+        assert option not in result.output
+
+
+def test_gemma_vllm_defaults_use_31b_qat_fp8_kv_cache(tmp_path) -> None:
     params = _model_params(
         [],
         "--generator-param",
         plugin="vllm_local",
-        model="google/gemma-4-26B-A4B-it",
+        model=DEFAULT_MODEL,
         cache_dir=tmp_path,
     )
+    assert DEFAULT_MODEL == "google/gemma-4-31B-it-qat-w4a16-ct"
+    assert params["tensor_parallel_size"] == 4
+    assert params["quantization"] == "compressed-tensors"
+    assert params["kv_cache_dtype"] == "fp8"
     assert params["max_num_batched_tokens"] == 16_384
     assert params["download_dir"] == str((tmp_path / "models").resolve())
 
@@ -45,7 +56,7 @@ def test_explicit_gemma_vllm_batch_size_wins(tmp_path) -> None:
         ["max_num_batched_tokens=8192"],
         "--generator-param",
         plugin="vllm_local",
-        model="google/gemma-4-26B-A4B-it",
+        model=DEFAULT_MODEL,
         cache_dir=tmp_path,
     )
     assert params["max_num_batched_tokens"] == 8_192
@@ -98,6 +109,7 @@ def test_cli_run_with_fake_backend_without_input_config(corpus_path, tmp_path) -
     assert resolved["source"]["params"]["path"] == str(corpus_path)
     assert resolved["target"]["examples"] == 4
     assert resolved["generation"]["params"]["custom"] is True
+    assert resolved["evaluation"]["llm"] is None
     assert resolved["composition"]["tasks"]["weights"] == {"closed_qa": 1.0}
     resumed = runner.invoke(app, ["run", "--resume", str(run_dir)])
     assert resumed.exit_code == 0, resumed.output

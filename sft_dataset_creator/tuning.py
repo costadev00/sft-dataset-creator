@@ -12,7 +12,7 @@ from sft_dataset_creator.backends import BackendProcess, create_token_counter
 from sft_dataset_creator.config import BatchingConfig, GenerationConfig, ProjectConfig, save_config
 from sft_dataset_creator.doctor import collect_doctor_report
 from sft_dataset_creator.metrics import GPUMonitor, stage_metrics
-from sft_dataset_creator.models import ChatMessage, Document, EvidenceSpan, GenerationRequest, SFTCandidate
+from sft_dataset_creator.models import Document, GenerationRequest
 from sft_dataset_creator.registry import create
 
 
@@ -72,48 +72,6 @@ def _generation_requests(
         requests.append(request)
         if len(requests) >= samples:
             break
-    return requests
-
-
-def _judge_requests(project: ProjectConfig, documents: list[Document], samples: int) -> list[GenerationRequest]:
-    strategy = create("evaluators", project.evaluation.plugin, project.evaluation)
-    requests: list[GenerationRequest] = []
-    for index, document in enumerate(islice(cycle(documents), samples)):
-        section = document.evidence_sections()[0]
-        end = min(len(section.text), max(1, 64))
-        candidate = SFTCandidate(
-            id=f"tune-candidate-{index:05d}",
-            slot_id=f"tune-{index:05d}",
-            attempt=1,
-            source=document.source,
-            document_id=document.id,
-            source_title=document.title,
-            task="closed_qa",
-            difficulty="medium",
-            instruction="Answer the grounded benchmark question using the supplied evidence.",
-            output=section.text[:end],
-            messages=[
-                ChatMessage(role="user", content="Answer using the evidence."),
-                ChatMessage(role="assistant", content=section.text[:end]),
-            ],
-            evidence=[
-                EvidenceSpan(
-                    document_id=document.id,
-                    section_id=section.id,
-                    start=0,
-                    end=end,
-                    quote=section.text[:end],
-                )
-            ],
-            generator="tuning",
-            model=project.generation.model,
-        )
-        request_id = f"tune-judge-{index:05d}"
-        requests.append(
-            strategy.build_llm_request(candidate, document).model_copy(
-                update={"request_id": request_id, "seed": index + 1}
-            )
-        )
     return requests
 
 
@@ -258,11 +216,13 @@ def tune_project(
     config: ProjectConfig,
     output: str | Path,
     *,
-    stage: Literal["generation", "evaluation", "both"] = "both",
+    stage: Literal["generation"] = "generation",
     samples: int = 32,
 ) -> tuple[ProjectConfig, Path]:
     if samples < 2:
         raise ValueError("tuning samples must be at least 2")
+    if stage != "generation":
+        raise ValueError("tuning only supports generation")
     documents = _sample_documents(config, samples)
     updated = config
     report: dict[str, Any] = {
@@ -279,22 +239,10 @@ def tune_project(
         report["vllm"] = importlib.metadata.version("vllm")
     except importlib.metadata.PackageNotFoundError:
         pass
-    if stage in {"generation", "both"}:
-        requests = _generation_requests(config, config.generation, documents, samples)
-        generation, stage_report = _tune_stage(config.generation, requests)
-        updated = updated.model_copy(update={"generation": generation})
-        report["stages"]["generation"] = stage_report
-    if stage in {"evaluation", "both"}:
-        if config.evaluation.llm is None:
-            if stage == "evaluation":
-                raise ValueError("evaluation tuning requires evaluation.llm")
-        else:
-            requests = _judge_requests(config, documents, samples)
-            evaluator, stage_report = _tune_stage(config.evaluation.llm, requests)
-            updated = updated.model_copy(
-                update={"evaluation": updated.evaluation.model_copy(update={"llm": evaluator})}
-            )
-            report["stages"]["evaluation"] = stage_report
+    requests = _generation_requests(config, config.generation, documents, samples)
+    generation, stage_report = _tune_stage(config.generation, requests)
+    updated = updated.model_copy(update={"generation": generation})
+    report["stages"]["generation"] = stage_report
     output_path = save_config(updated, output)
     report_path = output_path.with_name(f"{output_path.stem}.tuning-report.json")
     report["resolved_config_hash"] = updated.config_hash

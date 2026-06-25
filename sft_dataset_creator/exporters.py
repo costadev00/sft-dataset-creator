@@ -131,7 +131,7 @@ def _dataset_card(config: ProjectConfig, examples: int, enabled_splits: set[str]
             "",
             f"- Examples: {examples}",
             f"- Generator: `{config.generation.model}`",
-            f"- Evaluator: `{config.evaluation.llm.model if config.evaluation.llm else 'deterministic only'}`",
+            "- Evaluator: `deterministic only`",
             f"- Configuration hash: `{config.config_hash}`",
             "",
             "Review provenance, licenses, `report.json`, and the resolved configuration before public release.",
@@ -192,7 +192,7 @@ def export_run(run_dir: str | Path, *, config: ProjectConfig | None = None) -> P
         "formats": config.output.formats,
         "containers": config.output.containers,
         "generator": config.generation.model,
-        "evaluator": config.evaluation.llm.model if config.evaluation.llm else None,
+        "evaluator": "deterministic only",
         "config_hash": config.config_hash,
     }
     (export_root / "dataset_info.json").unlink(missing_ok=True)

@@ -32,13 +32,13 @@ def test_invalid_evidence_is_rejected() -> None:
     assert "invalid_evidence_offsets" in result.issues
 
 
-def test_hard_candidate_routes_when_llm_is_configured() -> None:
+def test_llm_routing_is_disabled_even_when_legacy_llm_is_configured() -> None:
     document = Document(id="doc", text="A sufficiently long grounded document passage.", source="test")
     config = EvaluationConfig(llm=GenerationConfig(plugin="fake", model="judge"))
     candidate = _candidate()
     result = deterministic_evaluation(candidate, document, [], config)
     assert result.verdict == "accept"
-    assert should_route_to_llm(candidate, result, config, seed=42)
+    assert not should_route_to_llm(candidate, result, config, seed=42)
 
 
 def test_source_dependent_instruction_is_rejected() -> None:

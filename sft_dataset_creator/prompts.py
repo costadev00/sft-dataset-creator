@@ -1,4 +1,4 @@
-"""Prompts sent to generation and evaluation models.
+"""Prompts sent to generation and model smoke-test requests.
 
 Edit this file to change model behavior. Keep instructions about the response
 schema and evidence offsets unless the corresponding parsers are changed too.

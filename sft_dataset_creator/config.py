@@ -141,6 +141,7 @@ class AcceptanceConfig(ConfigModel):
 class EvaluationConfig(ConfigModel):
     plugin: str = "composite"
     deterministic: Literal[True] = True
+    # Legacy field accepted for older resolved configs; the engine ignores it.
     llm: GenerationConfig | None = None
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)
@@ -149,9 +150,9 @@ class EvaluationConfig(ConfigModel):
 
 
 class SplitConfig(ConfigModel):
-    train: float = Field(default=0.90, ge=0.0, le=1.0)
-    validation: float = Field(default=0.05, ge=0.0, le=1.0)
-    test: float = Field(default=0.05, ge=0.0, le=1.0)
+    train: float = Field(default=1.0, ge=0.0, le=1.0)
+    validation: float = Field(default=0.0, ge=0.0, le=1.0)
+    test: float = Field(default=0.0, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def sum_to_one(self) -> "SplitConfig":
@@ -255,34 +256,19 @@ def gemma_cluster_preset(
         target=TargetConfig(examples=examples),
         generation=GenerationConfig(
             plugin="vllm_local",
-            model="google/gemma-4-26B-A4B-it",
+            model="google/gemma-4-31B-it-qat-w4a16-ct",
             batching=BatchingConfig(mode="async"),
             params={
                 "tensor_parallel_size": 4,
                 "gpu_memory_utilization": 0.92,
-                "dtype": "bfloat16",
-                "enable_thinking": False,
+                "quantization": "compressed-tensors",
+                "kv_cache_dtype": "fp8",
+                "enable_thinking": True,
                 "max_num_seqs": 16,
                 "max_num_batched_tokens": 16_384,
                 "enable_chunked_prefill": True,
                 "enable_prefix_caching": True,
             },
         ),
-        evaluation=EvaluationConfig(
-            llm=GenerationConfig(
-                plugin="vllm_local",
-                model="google/gemma-4-31B-it-qat-w4a16-ct",
-                batching=BatchingConfig(mode="async"),
-                params={
-                    "tensor_parallel_size": 4,
-                    "gpu_memory_utilization": 0.92,
-                    "quantization": "compressed-tensors",
-                    "enable_thinking": True,
-                    "max_num_seqs": 16,
-                    "max_num_batched_tokens": 16_384,
-                    "enable_chunked_prefill": True,
-                    "enable_prefix_caching": True,
-                },
-            )
-        ),
+        evaluation=EvaluationConfig(),
     )

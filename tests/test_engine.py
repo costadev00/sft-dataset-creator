@@ -33,6 +33,9 @@ def test_fake_backend_executes_and_resumes(project_config, tmp_path) -> None:
 
 
 def test_final_exports_do_not_leak_documents_between_splits(project_config, tmp_path) -> None:
+    project_config.output.splits.train = 0.5
+    project_config.output.splits.validation = 0.25
+    project_config.output.splits.test = 0.25
     run_dir = tmp_path / "run"
     plan = build_plan(project_config, run_dir)
     execute_plan(plan, project_config, run_dir=run_dir)
@@ -45,10 +48,7 @@ def test_final_exports_do_not_leak_documents_between_splits(project_config, tmp_
             seen[row["document_id"]] = split
 
 
-def test_export_with_train_only_omits_disabled_splits(project_config, tmp_path) -> None:
-    project_config.output.splits.train = 1.0
-    project_config.output.splits.validation = 0.0
-    project_config.output.splits.test = 0.0
+def test_default_export_is_train_only(project_config, tmp_path) -> None:
     run_dir = tmp_path / "train-only"
     plan = build_plan(project_config, run_dir)
     execute_plan(plan, project_config, run_dir=run_dir)
@@ -122,7 +122,7 @@ def test_multiple_examples_from_document_iterate_over_chunks(project_config, tmp
         assert [candidate.evidence[0].section_id for candidate in state.accepted_candidates()] == ["0", "1", "2"]
 
 
-def test_selective_llm_evaluation_uses_second_backend_process(project_config, tmp_path) -> None:
+def test_legacy_llm_evaluation_config_is_ignored(project_config, tmp_path) -> None:
     config = project_config.model_copy(
         update={
             "composition": project_config.composition.model_copy(
@@ -137,7 +137,12 @@ def test_selective_llm_evaluation_uses_second_backend_process(project_config, tm
     plan = build_plan(config, run_dir)
     report = execute_plan(plan, config, run_dir=run_dir)
     assert report.status == "completed"
-    assert report.llm_judged_examples == 4
+    assert report.llm_judged_examples == 0
+    assert report.metrics["llm_judge_coverage"] == 0.0
+    assert report.metrics["semantic_judge_configured"] is False
+    assert report.metrics["evaluation"]["requests"] == 0
+    with RunState(run_dir / "run.db") as state:
+        assert state.counts()["llm_judged"] == 0
 
 
 def test_attempt_limits_produce_explicit_partial_report(project_config, tmp_path) -> None:

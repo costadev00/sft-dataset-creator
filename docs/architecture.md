@@ -28,11 +28,11 @@ Task and difficulty weights are normalized and converted to integer quotas with 
 
 `run.db` is the transactional source of truth for slots, attempts, evaluations, and accepted canonical examples. An interrupted run resumes slots whose status is not accepted and never regenerates completed work.
 
-Execution proceeds in attempt rounds capped by both the per-slot and global budgets. A round generates only the currently pending slots and evaluates them before scheduling another attempt. The tokenizer and generator remain loaded between rounds unless generation and evaluation both use local vLLM models that need the same GPU memory. A bounded producer prepares requests in vectorized tokenizer batches while `AsyncLLM` continuously schedules GPU work. Results may complete in any order, but SQLite commits and quality decisions follow stable slot and attempt order.
+Execution proceeds in attempt rounds capped by both the per-slot and global budgets. A round generates only the currently pending slots and evaluates them before scheduling another attempt. The tokenizer and generator remain loaded between rounds. A bounded producer prepares requests in vectorized tokenizer batches while `AsyncLLM` continuously schedules GPU work. Results may complete in any order, but SQLite commits and quality decisions follow stable slot and attempt order.
 
 Each generation request receives one planned chunk rather than the complete document. Its context budget subtracts the system prompt, serialized request metadata, escaped JSON content, and a chat-template safety margin from `max_input_tokens`. Evidence offsets are local to the chunk and remain verifiable because the chunked corpus is stored in the immutable snapshot.
 
-Deterministic gates validate evidence offsets, minimum instruction quality, exact normalized duplicates, and self-contained SFT content. References to hidden source material such as "according to the text" or "cited in the document" are rejected across instruction, input, and output. The exporter repeats the source-reference gate so records accepted by older versions cannot be published. Routed candidates enter one continuous batch per round in a second isolated model process. Only rejected or reviewed slots advance to another attempt. Synchronous third-party backends and evaluators continue to run sequentially.
+Deterministic gates validate evidence offsets, minimum instruction quality, exact normalized duplicates, and self-contained SFT content. References to hidden source material such as "according to the text" or "cited in the document" are rejected across instruction, input, and output. The exporter repeats the source-reference gate so records accepted by older versions cannot be published. Only rejected or reviewed slots advance to another attempt. Synchronous third-party backends continue to run sequentially.
 
 The application runs as local Python processes; Docker is not part of the runtime architecture. Production model prompts are centralized in `sft_dataset_creator/prompts.py`.
 
@@ -55,4 +55,4 @@ exports/
 
 The manifest records hardware, installed plugins, package availability, models, and configuration hashes. Final exports retain document IDs, task metadata, evidence spans, and model provenance. Hidden reasoning and secrets are never persisted.
 
-`audit-sample` creates a blinded sample balanced across task, difficulty, and LLM-routing status. The system decisions are written to a separate key. After human labels are added, `audit-score` reports human acceptance, selective-routing rate, and recall over human-rejected candidates.
+`audit-sample` creates a blinded sample balanced across task and difficulty. The system decisions are written to a separate key. After human labels are added, `audit-score` reports human acceptance and recall over human-rejected candidates.

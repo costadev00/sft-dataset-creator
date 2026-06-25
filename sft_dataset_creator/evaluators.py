@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Iterable
 
@@ -114,20 +113,7 @@ def should_route_to_llm(
     config: EvaluationConfig,
     seed: int,
 ) -> bool:
-    if evaluation.verdict != "accept" or config.llm is None:
-        return False
-    routing = config.routing
-    if routing.judge_hard_tasks and candidate.difficulty == "hard":
-        return True
-    if routing.judge_truncated_context and candidate.metadata.get("context_truncated"):
-        return True
-    if routing.judge_high_risk and candidate.metadata.get("risk") == "high":
-        return True
-    if routing.judge_weak_grounding and "weak_grounding" in evaluation.issues:
-        return True
-    digest = hashlib.sha256(f"{seed}:{candidate.id}".encode("utf-8")).digest()
-    sample = int.from_bytes(digest[:8], "big") / 2**64
-    return sample < routing.audit_fraction
+    return False
 
 
 def llm_evaluation(

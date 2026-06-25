@@ -19,7 +19,6 @@ from sft_dataset_creator.exporters import export_run
 from sft_dataset_creator.metrics import GPUMonitor, stage_metrics
 from sft_dataset_creator.models import (
     DatasetPlan,
-    EvaluationResult,
     GenerationRequest,
     PlannedSlot,
     RunManifest,
@@ -384,100 +383,6 @@ def _generate(
     }
 
 
-def _judge(
-    strategy: Any,
-    routed: Sequence[tuple[SFTCandidate, Any]],
-    plan: DatasetPlan,
-    config: ProjectConfig,
-    callback: EventCallback | None,
-    round_number: int,
-) -> tuple[dict[str, EvaluationResult], dict[str, Any]]:
-    if not routed or config.evaluation.llm is None:
-        return {}, _empty_stage_metrics()
-    _emit(callback, "evaluation_started", {"round": round_number, "candidates": len(routed)})
-    results: dict[str, EvaluationResult] = {}
-    latencies: list[float] = []
-    input_tokens = 0
-    output_tokens = 0
-    max_queue_depth = 0
-    monitor = GPUMonitor()
-    started = 0.0
-    startup_seconds = 0.0
-    duration = 0.0
-    gpu: dict[str, Any] = {}
-    with BackendProcess(config.evaluation.llm) as judge:
-        startup_seconds = judge.startup_seconds
-        monitor.start()
-        started = time.perf_counter()
-        try:
-            builder = getattr(strategy, "build_llm_request", None)
-            parser = getattr(strategy, "evaluation_from_response", None)
-            if builder is not None and parser is not None:
-                candidate_by_request: dict[str, SFTCandidate] = {}
-                requests: list[GenerationRequest] = []
-                for candidate, document in routed:
-                    request_id = f"judge:{candidate.id}"
-                    request = builder(candidate, document).model_copy(
-                        update={"request_id": request_id, "seed": _request_seed(plan.seed, request_id)}
-                    )
-                    candidate_by_request[request_id] = candidate
-                    requests.append(request)
-                for outcome in judge.generate_many(requests):
-                    candidate = candidate_by_request[outcome.request_id]
-                    if outcome.error is not None or outcome.response is None:
-                        results[candidate.id] = EvaluationResult(
-                            candidate_id=candidate.id,
-                            verdict="review",
-                            evaluator=f"llm:{config.evaluation.llm.model}",
-                            selected_for_llm=True,
-                            issues=["judge_error", outcome.error or "backend returned no response"],
-                        )
-                    else:
-                        try:
-                            results[candidate.id] = parser(candidate, outcome.response)
-                        except Exception as exc:
-                            results[candidate.id] = EvaluationResult(
-                                candidate_id=candidate.id,
-                                verdict="review",
-                                evaluator=f"llm:{config.evaluation.llm.model}",
-                                selected_for_llm=True,
-                                issues=["judge_error", str(exc)],
-                            )
-                        input_tokens += outcome.response.input_tokens or 0
-                        output_tokens += outcome.response.output_tokens or 0
-                    latencies.append(outcome.latency_seconds)
-                    max_queue_depth = max(max_queue_depth, outcome.queue_depth)
-            else:
-                for candidate, document in routed:
-                    try:
-                        results[candidate.id] = strategy.llm(candidate, document, judge)
-                    except Exception as exc:
-                        results[candidate.id] = EvaluationResult(
-                            candidate_id=candidate.id,
-                            verdict="review",
-                            evaluator=f"llm:{config.evaluation.llm.model}",
-                            selected_for_llm=True,
-                            issues=["judge_error", str(exc)],
-                        )
-        finally:
-            duration = time.perf_counter() - started
-            gpu = monitor.stop()
-    _emit(callback, "evaluation_finished", {"round": round_number})
-    return results, {
-        **stage_metrics(
-            requests=len(routed),
-            duration_seconds=duration,
-            startup_seconds=startup_seconds,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            latencies=latencies,
-            max_queue_depth=max_queue_depth,
-            gpu=gpu,
-        ),
-        "round": round_number,
-    }
-
-
 def _evaluate_generated(
     state: RunState,
     documents: dict[str, Any],
@@ -491,18 +396,6 @@ def _evaluate_generated(
     candidates = sorted(state.generated_candidates(), key=lambda value: (ordinal[value.slot_id], value.attempt))
     if not candidates:
         return _empty_stage_metrics()
-    accepted_at_start = list(state.accepted_candidates())
-    accepted_slots = {candidate.slot_id for candidate in accepted_at_start}
-    routed: list[tuple[SFTCandidate, Any]] = []
-    for candidate in candidates:
-        if candidate.slot_id in accepted_slots:
-            continue
-        document = documents[candidate.document_id]
-        preliminary = strategy.deterministic(candidate, document, accepted_at_start)
-        if preliminary.verdict == "accept" and strategy.should_route(candidate, preliminary, plan.seed):
-            routed.append((candidate, document))
-    llm_results, metrics = _judge(strategy, routed, plan, config, callback, round_number)
-
     accepted = list(state.accepted_candidates())
     accepted_slots = {candidate.slot_id for candidate in accepted}
     for candidate in candidates:
@@ -510,24 +403,12 @@ def _evaluate_generated(
             state.mark_superseded(candidate)
             continue
         document = documents[candidate.document_id]
-        deterministic = strategy.deterministic(candidate, document, accepted)
-        if deterministic.verdict == "accept" and strategy.should_route(candidate, deterministic, plan.seed):
-            evaluation = llm_results.get(candidate.id)
-            if evaluation is None:
-                evaluation = EvaluationResult(
-                    candidate_id=candidate.id,
-                    verdict="review",
-                    evaluator=f"llm:{config.evaluation.llm.model if config.evaluation.llm else 'missing'}",
-                    selected_for_llm=True,
-                    issues=["judge_result_missing"],
-                )
-        else:
-            evaluation = deterministic
+        evaluation = strategy.deterministic(candidate, document, accepted)
         state.record_evaluation(candidate, evaluation)
         if evaluation.verdict == "accept":
             accepted.append(candidate)
             accepted_slots.add(candidate.slot_id)
-    return metrics if "round" in metrics else {**metrics, "round": round_number}
+    return {**_empty_stage_metrics(), "round": round_number}
 
 
 def execute_plan(
@@ -555,11 +436,6 @@ def execute_plan(
         counts = state.counts()
         jobs = _generation_jobs(state, plan, config)
         counter = create_token_counter(config.generation) if jobs else None
-        local_model_swap = (
-            config.generation.plugin == "vllm_local"
-            and config.evaluation.llm is not None
-            and config.evaluation.llm.plugin == "vllm_local"
-        )
 
         def execute_round(generator_process: BackendProcess | None = None) -> None:
             nonlocal counts, jobs, round_number
@@ -585,13 +461,10 @@ def execute_plan(
             _emit(callback, "round_finished", {"round": round_number, **counts})
             jobs = _generation_jobs(state, plan, config)
 
-        if jobs and not local_model_swap:
+        if jobs:
             with BackendProcess(config.generation) as generator_process:
                 while jobs and counts["accepted"] < config.target.examples:
                     execute_round(generator_process)
-        else:
-            while jobs and counts["accepted"] < config.target.examples:
-                execute_round()
 
         generation_metrics = _aggregate_stage_metrics(generation_rounds)
         evaluation_metrics = _aggregate_stage_metrics(evaluation_rounds)
@@ -608,14 +481,12 @@ def execute_plan(
             rejected_examples=counts["rejected"],
             reviewed_examples=counts["reviewed"],
             speculative_examples=counts["speculative"],
-            llm_judged_examples=counts["llm_judged"],
+            llm_judged_examples=0,
             deficits=state.deficits(),
             metrics={
                 "acceptance_rate": counts["accepted"] / counts["attempted"] if counts["attempted"] else 0.0,
-                "llm_judge_coverage": (
-                    counts["llm_judged"] / counts["attempted"] if counts["attempted"] else 0.0
-                ),
-                "semantic_judge_configured": config.evaluation.llm is not None,
+                "llm_judge_coverage": 0.0,
+                "semantic_judge_configured": False,
                 "python": platform.python_version(),
                 "generation": generation_metrics,
                 "evaluation": evaluation_metrics,

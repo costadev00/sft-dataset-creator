@@ -114,12 +114,7 @@ def collect_doctor_report(config: ProjectConfig | None = None, *, smoke_models: 
             )
         if "parquet" in config.output.containers and not report["packages"]["pyarrow"]:
             report["errors"].append("Parquet output requires the 'hf' extra with pyarrow")
-        for stage, model_config in (
-            ("generation", config.generation),
-            ("evaluation", config.evaluation.llm),
-        ):
-            if model_config is None:
-                continue
+        for stage, model_config in (("generation", config.generation),):
             if model_config.plugin == "vllm_local":
                 if not report["packages"]["vllm"]:
                     report["errors"].append(f"{stage} requires the 'local' extra with vLLM")
@@ -130,22 +125,17 @@ def collect_doctor_report(config: ProjectConfig | None = None, *, smoke_models: 
                     )
             if model_config.plugin == "openai_compatible" and not report["packages"]["openai"]:
                 report["errors"].append(f"{stage} requires the 'openai' extra")
-        if config.evaluation.llm is None:
-            report["warnings"].append(
-                "LLM evaluation is disabled; deterministic gates cannot verify semantic grounding"
-            )
+        report["warnings"].append("Deterministic-only evaluation enabled.")
         if smoke_models and not report["errors"]:
-            for model_config in [config.generation, config.evaluation.llm]:
-                if model_config is not None:
-                    try:
-                        smoke = _smoke_backend(model_config)
-                        report["models"].append(smoke)
-                        if not smoke["ok"]:
-                            report["errors"].append(
-                                f"model smoke test returned invalid output for {model_config.model}"
-                            )
-                    except Exception as exc:
-                        report["errors"].append(f"model smoke test failed for {model_config.model}: {exc}")
+            try:
+                smoke = _smoke_backend(config.generation)
+                report["models"].append(smoke)
+                if not smoke["ok"]:
+                    report["errors"].append(
+                        f"model smoke test returned invalid output for {config.generation.model}"
+                    )
+            except Exception as exc:
+                report["errors"].append(f"model smoke test failed for {config.generation.model}: {exc}")
     report["ready"] = not report["errors"]
     return report
 
