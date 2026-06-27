@@ -1,0 +1,504 @@
+\documentclass{article}
+
+% This file follows the ICML 2026 preprint template used by the arXiv source of:
+% "FineInstructions: Scaling Synthetic Instructions to Pre-Training Scale"
+% https://arxiv.org/abs/2601.22146
+%
+% Overleaf setup:
+% 1. Create a project from the ICML 2026 template, or upload the arXiv TeX
+%    source files for 2601.22146.
+% 2. Ensure icml2026.sty and icml2026.bst are in the project root.
+% 3. Set this file as the main TeX file.
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazilian]{babel}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{url}
+\usepackage{hyperref}
+
+\usepackage[preprint]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+
+\setlist[itemize]{leftmargin=*,topsep=0.2em,itemsep=0.1em}
+\setlist[enumerate]{leftmargin=*,topsep=0.2em,itemsep=0.1em}
+
+\newcommand{\datasetname}{\textsc{Wiki-Brazil-SFT}}
+\newcommand{\toolname}{\texttt{sft-dataset-creator}}
+\newcommand{\runname}{\texttt{wiki-brazil-all-tasks-22596}}
+
+\icmltitlerunning{Pipeline Deterministica para Dados Sinteticos de SFT}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Uma Pipeline Deterministica para Geracao e Filtragem de Dados Sinteticos de SFT em Portugues Brasileiro}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Autor(es) a definir}{inst}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{inst}{Instituicao a definir}
+  \icmlcorrespondingauthor{Autor correspondente}{email@dominio.org}
+  \icmlkeywords{Synthetic Data, Instruction Tuning, SFT, Deterministic Evaluation, Portuguese}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Dados supervisionados de instrucao e resposta sao um recurso central para
+ajustar modelos de linguagem ao uso interativo, mas sua construcao manual e
+cara e dificil de escalar. Este artigo descreve uma pipeline reprodutivel para
+gerar dados sinteticos de supervised fine-tuning (SFT) em portugues brasileiro
+a partir de artigos da Wikipedia. O metodo combina selecao e chunking
+deterministicos do corpus, planejamento balanceado de tipos de tarefa e
+dificuldade, geracao batelada com um unico modelo instrucional local e uma
+etapa de filtragem inteiramente deterministica. Diferentemente de pipelines que
+dependem de um segundo modelo julgador, a avaliacao principal aceita apenas
+candidatos que satisfazem regras verificaveis de formato, auto-contencao,
+nao duplicacao e ancoragem em spans de evidencia extraidos do documento de
+origem. Em uma execucao sobre o corpus \texttt{costadev00/wiki-brazil}, o
+sistema planejou 22.596 exemplos a partir de 1.614 documentos elegiveis,
+gerou 35.876 tentativas e exportou 20.378 exemplos aceitos em tres formatos
+de SFT. A analise do ledger SQLite da execucao mostra taxa de aceitacao de
+56,8\%, com rejeicoes dominadas por problemas de evidencia, duplicatas
+normalizadas e referencias ao contexto oculto.
+\end{abstract}
+
+\noindent
+\textbf{Palavras-chave:} dados sinteticos; SFT; instruction tuning; avaliacao
+deterministica; grounding; portugues brasileiro.
+
+\section{Introducao}
+
+Modelos de linguagem de grande escala costumam ser treinados primeiro em
+objetivos auto-supervisionados sobre grandes colecoes de texto e, depois,
+adaptados com exemplos supervisionados de instrucoes e respostas
+\citep{ouyang2022training,wei2022finetuned}. Esse segundo estagio, usualmente
+chamado de instruction tuning ou supervised fine-tuning (SFT), aproxima o
+comportamento do modelo do modo como usuarios formulam pedidos em sistemas
+interativos. Entretanto, datasets supervisionados de alta qualidade sao caros,
+limitados em escala e frequentemente concentrados em ingles.
+
+Uma alternativa e transformar documentos existentes em pares sinteticos de
+instrucao e resposta. Trabalhos recentes investigam geracao de dados
+instrucionais a partir de queries, templates, documentos e modelos auxiliares,
+incluindo pipelines em escala de pre-treinamento como FineInstructions
+\citep{patel2026fineinstructions}. O presente trabalho parte de motivacao
+semelhante, mas foca em um cenario menor e auditavel: a construcao de um
+dataset sintetico em portugues brasileiro, com rastreabilidade por documento e
+filtragem deterministica das geracoes.
+
+Descrevemos a implementacao de \toolname{}, uma biblioteca e CLI para planejar,
+gerar, avaliar e exportar datasets sinteticos de SFT. A contribuicao central
+deste artigo e a formalizacao da pipeline de filtragem: um conjunto de gates
+automaticos que separa a tarefa generativa, realizada por um LLM, da decisao de
+aceitacao, realizada por regras verificaveis. Essa separacao reduz dependencia
+de julgamento opaco por modelos adicionais e torna cada decisao inspecionavel a
+partir dos artefatos da execucao.
+
+\paragraph{Contribuicoes.}
+Este artigo apresenta:
+(i) uma pipeline reprodutivel para transformar artigos da Wikipedia em exemplos
+de SFT em portugues;
+(ii) um planejamento deterministico de slots por documento, tarefa e
+dificuldade;
+(iii) uma estrategia de filtragem baseada em schema, auto-contencao,
+deduplicacao e evidencia;
+e (iv) uma analise quantitativa de uma run com 35.876 tentativas e 20.378
+exemplos aceitos.
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=0.85cm and 0.9cm,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=0.75cm, text width=2.65cm, font=\small},
+  gate/.style={draw, diamond, aspect=1.8, align=center, text width=2.2cm, font=\small},
+  arrow/.style={-Latex, thick}
+]
+\node[box] (source) {Fonte\\Hugging Face};
+\node[box, right=of source] (profile) {Filtro\\\texttt{wikipedia\_ptbr}};
+\node[box, right=of profile] (chunk) {Chunking\\8.000 chars};
+\node[box, right=of chunk] (plan) {Plano\\deterministico};
+\node[box, below=of plan] (gen) {Geracao\\vLLM local};
+\node[gate, left=of gen] (schema) {JSON e schema\\validos?};
+\node[gate, left=of schema] (quality) {Gates\\deterministicos};
+\node[box, left=of quality] (accepted) {Exemplo\\aceito};
+\node[box, below=of quality] (retry) {Nova tentativa\\ate limite};
+\node[box, below=of accepted] (export) {Exportacao\\com trava final};
+
+\draw[arrow] (source) -- (profile);
+\draw[arrow] (profile) -- (chunk);
+\draw[arrow] (chunk) -- (plan);
+\draw[arrow] (plan) -- (gen);
+\draw[arrow] (gen) -- (schema);
+\draw[arrow] (schema) -- node[above,font=\scriptsize] {sim} (quality);
+\draw[arrow] (quality) -- node[above,font=\scriptsize] {accept} (accepted);
+\draw[arrow] (accepted) -- (export);
+\draw[arrow] (schema.south) |- node[pos=0.25,right,font=\scriptsize] {nao} (retry.east);
+\draw[arrow] (quality.south) -- node[right,font=\scriptsize] {reject} (retry.north);
+\draw[arrow] (retry.east) -| (gen.south);
+\end{tikzpicture}
+\caption{Visao geral da pipeline. O LLM propoe candidatos estruturados, mas a
+aceitacao depende de validacoes deterministicas e de uma trava adicional antes
+da exportacao.}
+\label{fig:pipeline}
+\end{figure*}
+
+\section{Corpus e Pre-processamento}
+
+A fonte usada na execucao principal foi o dataset Hugging Face
+\texttt{costadev00/wiki-brazil}, split \texttt{train}, em modo streaming. O
+campo de identificacao foi \texttt{\_\_row\_index\_\_}; texto, titulo, secoes e
+licenca foram mapeados dos campos \texttt{text}, \texttt{title},
+\texttt{sections} e \texttt{license}.
+
+Antes de qualquer chamada ao modelo, cada registro foi normalizado como um
+documento interno e passou pelo perfil \texttt{wikipedia\_ptbr}. Esse perfil
+remove documentos vazios, paginas fora do namespace principal, categorias,
+templates, arquivos, paginas de ajuda, portais, redirects, paginas de
+desambiguacao e textos com menos de 300 caracteres. Essa filtragem inicial
+reduz o risco de gerar exemplos a partir de paginas administrativas, muito
+curtas ou pouco informativas.
+
+Os documentos selecionados foram divididos em chunks de ate 8.000 caracteres,
+com overlap de 400 caracteres. Cada chunk funciona como uma secao de evidencia
+e como contexto de entrada para a geracao. O chunking tem tres funcoes:
+controlar o tamanho de contexto, permitir offsets de evidencia verificaveis e
+distribuir tentativas de um mesmo documento por regioes diferentes do artigo.
+
+\section{Planejamento Deterministico}
+
+O planejamento nao chama o modelo. Ele apenas fixa, de forma reprodutivel, a
+relacao entre documentos, tarefas, dificuldades e chunks. A run analisada,
+\runname{}, utilizou seed 42 e selecionou todos os 1.614 documentos elegiveis
+(\texttt{fraction=1.0}). O alvo foi de 22.596 exemplos, com minimo e maximo de
+14 exemplos por documento. Como $22\,596 = 1\,614 \times 14$, cada documento
+recebeu 14 slots planejados.
+
+As tarefas foram balanceadas globalmente entre 14 tipos:
+\texttt{classification}, \texttt{closed\_qa}, \texttt{comparison},
+\texttt{concept\_explanation}, \texttt{definition},
+\texttt{didactic\_explanation}, \texttt{fact\_checking},
+\texttt{information\_extraction}, \texttt{rewrite}, \texttt{short\_answer},
+\texttt{structured\_extraction}, \texttt{summarization}, \texttt{taxonomy} e
+\texttt{timeline}. Cada tipo recebeu exatamente 1.614 slots. As dificuldades
+seguiram pesos 0,25 para \texttt{easy}, 0,50 para \texttt{medium} e 0,25 para
+\texttt{hard}. A atribuicao documento--tarefa foi embaralhada pela seed; logo,
+o balanceamento e global, nao uma garantia de uma tarefa de cada tipo por
+documento.
+
+\begin{table}[t]
+\centering
+\caption{Configuracao principal da run \runname{}.}
+\label{tab:config}
+\small
+\begin{tabular}{ll}
+\toprule
+Parametro & Valor \\
+\midrule
+Documentos elegiveis & 1.614 \\
+Slots planejados & 22.596 \\
+Exemplos por documento & 14 min.; 14 max. \\
+Tarefas & 14 tipos balanceados \\
+Dificuldades & 25\% easy; 50\% medium; 25\% hard \\
+Tentativas por slot & ate 5 \\
+Reserva de documentos & 0\% \\
+Chunk & 8.000 chars; overlap 400 \\
+Seed & 42 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Geracao dos Candidatos}
+
+A geracao foi realizada com um unico modelo local, executado por
+\texttt{vllm\_local}: \texttt{google/gemma-4-31B-it-qat-w4a16-ct}. A
+configuracao usou \texttt{tensor\_parallel\_size=4},
+\texttt{quantization=compressed-tensors}, \texttt{kv\_cache\_dtype=fp8},
+\texttt{max\_num\_batched\_tokens=16384}, temperatura 0,1, janela de contexto
+de 65.536 tokens, limite de entrada de 53.248 tokens, limite de saida de 4.096
+tokens e ate 32 requisicoes em voo. O uso de vLLM permite manter o gerador
+carregado entre rodadas e executar requisicoes em lote \citep{kwon2023vllm}.
+
+Cada requisicao contem um prompt de sistema fixo e um payload JSON com tipo de
+tarefa, lingua, dificuldade, identificador do documento, titulo, indicador de
+truncamento e trecho-fonte. O modelo deve retornar JSON compativel com um
+schema fechado contendo \texttt{instruction}, \texttt{input}, \texttt{output},
+\texttt{risk} e ao menos um item de \texttt{evidence}, com \texttt{section\_id},
+\texttt{start}, \texttt{end} e, opcionalmente, \texttt{quote}.
+
+O prompt instrui o modelo a usar apenas fatos do trecho e a nao mencionar texto,
+documento, contexto, passagem ou fonte oculta. Essa instrucao, contudo, e
+tratada apenas como uma orientacao de geracao: a conformidade e verificada por
+filtros deterministas na etapa seguinte.
+
+\section{Filtragem Deterministica}
+
+A filtragem acontece em camadas. Um candidato so chega ao dataset final se
+passar por todas as validacoes descritas nesta secao.
+
+\subsection{Parse e validacao estrutural}
+
+Primeiro, a resposta precisa ser parseavel como JSON e respeitar o schema
+esperado. Se o backend retorna JSON invalido, campos ausentes ou spans
+impossiveis de construir como \texttt{EvidenceSpan}, a tentativa e registrada
+como \texttt{error}, nao como rejeicao semantica. Na run principal, houve 3.180
+erros desse tipo: 3.157 associados a parse ou schema JSON e 23 a validacao
+Pydantic.
+
+\subsection{Campos essenciais}
+
+Para candidatos estruturalmente validos, o avaliador verifica se
+\texttt{instruction} e \texttt{output} nao estao vazios e se a instrucao tem
+ao menos 12 caracteres. Falhas recebem as issues
+\texttt{empty\_instruction\_or\_output} ou
+\texttt{instruction\_too\_short}.
+
+\subsection{Auto-contencao}
+
+O exemplo final nao deve depender de um contexto invisivel para o usuario. Por
+isso, a pipeline rejeita candidatos que contenham expressoes como ``de acordo
+com o texto'', ``com base no documento'', ``according to the passage'' ou
+equivalentes em portugues, ingles e espanhol. A deteccao e aplicada aos campos
+visiveis ao usuario: \texttt{instruction}, \texttt{input} e \texttt{output}.
+A issue associada e \texttt{source\_reference\_in\_candidate}.
+
+\subsection{Deduplicacao}
+
+Cada candidato recebe uma impressao digital textual obtida por normalizacao
+Unicode, remocao de marcas combinantes, \texttt{casefold}, colapso de espacos
+e concatenacao de \texttt{instruction}, \texttt{input} e \texttt{output}. Se a
+impressao digital ja existir entre exemplos aceitos, o candidato e rejeitado
+com \texttt{duplicate\_candidate}.
+
+\subsection{Evidencia}
+
+Cada candidato precisa apontar para ao menos um span de evidencia em uma secao
+do documento usado na tentativa. Para cada span, a pipeline verifica se
+\texttt{section\_id} existe, se \texttt{start} e \texttt{end} estao dentro dos
+limites da secao, se \texttt{end > start}, se o \texttt{quote} fornecido bate
+com o trecho correspondente e se o span recuperado tem ao menos 20 caracteres.
+
+As issues possiveis sao \texttt{invalid\_section},
+\texttt{invalid\_evidence\_offsets}, \texttt{evidence\_quote\_mismatch},
+\texttt{missing\_grounding} e \texttt{weak\_grounding}. A ultima e registrada
+como diagnostico, mas nao causa rejeicao isoladamente. As demais sao criticas.
+
+\subsection{Decisao e novas tentativas}
+
+O avaliador acumula as issues do candidato. Se qualquer issue critica aparece,
+o veredito e \texttt{reject}; caso contrario, e \texttt{accept}. Issues
+criticas incluem campos vazios, instrucao curta, secao invalida, offsets
+invalidos, quote divergente, ausencia de grounding, referencia a fonte oculta e
+duplicata normalizada.
+
+Slots nao aceitos permanecem pendentes ate o limite de tentativas. Na run
+analisada, cada slot podia ser tentado ate cinco vezes. Como
+\texttt{reserve\_fraction=0.0}, as novas tentativas continuaram usando os
+documentos planejados originalmente.
+
+\subsection{Trava final de exportacao}
+
+Antes da escrita dos arquivos finais, o exportador reabre os candidatos aceitos
+no banco SQLite e executa novamente a deteccao de referencia a fonte oculta.
+Se qualquer exemplo aceito ainda depender do texto-fonte invisivel, a
+exportacao falha. Essa etapa funciona como uma garantia de ultima linha.
+
+\section{Resultados}
+
+A Tabela~\ref{tab:results} resume a execucao principal. A run terminou como
+\texttt{partial}, pois 2.218 slots chegaram ao limite de cinco tentativas sem
+produzir candidato aceito. Ainda assim, os arquivos exportados contem 20.378
+exemplos em cada uma das tres visoes: \texttt{messages},
+\texttt{prompt\_completion} e \texttt{alpaca}. Como os splits configurados
+foram \texttt{train=1.0}, \texttt{validation=0.0} e \texttt{test=0.0}, apenas
+o split de treino foi produzido.
+
+\begin{table}[t]
+\centering
+\caption{Resumo quantitativo da run principal.}
+\label{tab:results}
+\small
+\begin{tabular}{lr}
+\toprule
+Metrica & Valor \\
+\midrule
+Alvo planejado & 22.596 \\
+Exemplos aceitos & 20.378 \\
+Tentativas totais & 35.876 \\
+Rejeicoes avaliadas & 12.318 \\
+Erros de parse/schema/backend & 3.180 \\
+Slots pendentes & 2.218 \\
+Taxa de aceitacao & 56,8\% \\
+Exemplos julgados por LLM & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\caption{Principais issues registradas nos candidatos rejeitados. As contagens
+nao sao mutuamente exclusivas: um candidato pode acumular mais de uma issue.}
+\label{tab:issues}
+\small
+\begin{tabular}{lrl}
+\toprule
+Issue & Ocorrencias & Interpretacao \\
+\midrule
+\texttt{missing\_grounding} & 7.925 & Nenhum span recuperavel sustentou o candidato. \\
+\texttt{invalid\_section} & 7.890 & O \texttt{section\_id} indicado nao existia no chunk usado. \\
+\texttt{duplicate\_candidate} & 2.870 & Conteudo repetido apos normalizacao. \\
+\texttt{source\_reference\_in\_candidate} & 1.855 & Instrucao, input ou output dependiam do texto oculto. \\
+\texttt{weak\_grounding} & 927 & Evidencia recuperada era curta demais. \\
+\texttt{invalid\_evidence\_offsets} & 232 & Offsets fora dos limites ou inconsistentes. \\
+\texttt{empty\_instruction\_or\_output} & 16 & Instrucao ou resposta vazia. \\
+\texttt{evidence\_quote\_mismatch} & 9 & Quote fornecido nao batia com o span. \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+A Tabela~\ref{tab:attempts} mostra que a maior parte dos exemplos aceitos veio
+da primeira tentativa. Ainda assim, as tentativas adicionais recuperaram 2.610
+exemplos que seriam perdidos em uma pipeline com geracao unica por slot.
+
+\begin{table}[t]
+\centering
+\caption{Exemplos aceitos por numero da tentativa.}
+\label{tab:attempts}
+\small
+\begin{tabular}{lr}
+\toprule
+Tentativa & Aceitos \\
+\midrule
+1 & 17.768 \\
+2 & 1.499 \\
+3 & 616 \\
+4 & 303 \\
+5 & 192 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+O par mais frequente de issues foi \texttt{invalid\_section} +
+\texttt{missing\_grounding}, com 7.180 ocorrencias. Esse resultado indica que
+uma parcela relevante das rejeicoes decorreu de referencias de evidencia
+mal alinhadas ao chunk efetivamente usado, e nao necessariamente de baixa
+qualidade textual da resposta. Em outras palavras, a principal fragilidade
+observada esta na capacidade do gerador de apontar corretamente para a
+evidencia, nao apenas em produzir respostas plausiveis.
+
+\section{Discussao}
+
+Os resultados mostram que a separacao entre geracao e aceitacao oferece uma
+forma simples de auditar datasets sinteticos. O modelo e usado para propor
+exemplos, mas nao para decidir se eles entram no corpus final. Essa decisao e
+tomada por regras transparentes: parse, schema, auto-contencao, deduplicacao e
+evidencia. A consequencia pratica e que cada exemplo aceito pode ser rastreado
+ate seu documento, chunk, tarefa, tentativa e avaliacao.
+
+O desenho tambem evita uma dependencia operacional importante: nao ha segundo
+modelo de avaliacao na run analisada. O relatorio final registra
+\texttt{llm\_judged\_examples=0}, \texttt{llm\_judge\_coverage=0.0} e
+\texttt{semantic\_judge\_configured=false}. Isso reduz custo e variancia, mas
+tambem limita o tipo de qualidade que pode ser garantida automaticamente.
+
+\section{Limitacoes}
+
+A avaliacao deterministica verifica forma, rastreabilidade e sinais de
+grounding, mas nao substitui uma checagem semantica completa de todas as
+afirmacoes da resposta. Um span valido demonstra que existe evidencia
+recuperavel, mas nao garante que toda a resposta seja integralmente sustentada
+pelo trecho.
+
+Outra limitacao e que o filtro de duplicatas e exato apos normalizacao textual.
+Ele detecta repeticoes triviais, mas nao necessariamente parafrases
+semanticamente equivalentes. Alem disso, como a run principal terminou como
+\texttt{partial}, o corpus exportado contem 20.378 exemplos aceitos, nao os
+22.596 planejados.
+
+Por fim, o volume de \texttt{invalid\_section} sugere que a relacao entre
+prompt, chunk selecionado e IDs de secao pode ser melhorada. Trabalhos futuros
+podem explorar representacoes de evidencia mais faceis para o modelo, validacao
+incremental durante a decodificacao ou geracao em duas etapas: primeiro o
+exemplo, depois a atribuicao de evidencia.
+
+\section{Conclusao}
+
+Este artigo formalizou uma pipeline para gerar e filtrar dados sinteticos de
+SFT em portugues brasileiro a partir de documentos da Wikipedia. A execucao
+analisada mostra que e possivel produzir dezenas de milhares de tentativas com
+um unico modelo local e exportar mais de 20 mil exemplos aceitos usando apenas
+gates deterministas. A principal contribuicao metodologica e tornar explicita a
+fronteira entre geracao e validacao: o LLM produz candidatos, mas a entrada no
+dataset depende de propriedades verificaveis e auditaveis.
+
+\section*{Disponibilidade dos artefatos}
+
+Os artefatos locais da execucao incluem \texttt{config.resolved.json},
+\texttt{plan.json}, \texttt{corpus-selected.jsonl}, \texttt{run.db},
+\texttt{report.json} e os arquivos em \texttt{exports/}. Antes de uma
+publicacao externa, recomenda-se revisar licencas do corpus, politicas de
+redistribuicao e uma amostra manual dos exemplos aceitos.
+
+\bibliographystyle{icml2026}
+\begin{thebibliography}{9}
+
+\bibitem[Kwon et~al.(2023)]{kwon2023vllm}
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu,
+Joseph E. Gonzalez, Hao Zhang, and Ion Stoica.
+\newblock Efficient memory management for large language model serving with
+PagedAttention.
+\newblock In \emph{Proceedings of SOSP}, 2023.
+
+\bibitem[Ouyang et~al.(2022)]{ouyang2022training}
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela
+Mishkin, Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et~al.
+\newblock Training language models to follow instructions with human feedback.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2022.
+
+\bibitem[Patel et~al.(2026)]{patel2026fineinstructions}
+Ajay Patel, Colin Raffel, and Chris Callison-Burch.
+\newblock FineInstructions: Scaling Synthetic Instructions to Pre-Training
+Scale.
+\newblock \emph{arXiv preprint arXiv:2601.22146}, 2026.
+
+\bibitem[Taori et~al.(2023)]{taori2023alpaca}
+Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos
+Guestrin, Percy Liang, and Tatsunori B. Hashimoto.
+\newblock Stanford Alpaca: An instruction-following LLaMA model.
+\newblock Technical report, Stanford CRFM, 2023.
+
+\bibitem[Wang et~al.(2023)]{wang2023selfinstruct}
+Yizhong Wang, Yeganeh Kordi, Swaroop Mishra, Alisa Liu, Noah A. Smith, Daniel
+Khashabi, and Hannaneh Hajishirzi.
+\newblock Self-Instruct: Aligning language models with self-generated
+instructions.
+\newblock In \emph{Proceedings of ACL}, 2023.
+
+\bibitem[Wei et~al.(2022)]{wei2022finetuned}
+Jason Wei, Maarten Bosma, Vincent Y. Zhao, Kelvin Guu, Adams Wei Yu, Brian
+Lester, Nan Du, Andrew M. Dai, and Quoc V. Le.
+\newblock Finetuned language models are zero-shot learners.
+\newblock In \emph{International Conference on Learning Representations}, 2022.
+
+\end{thebibliography}
+
+\end{document}

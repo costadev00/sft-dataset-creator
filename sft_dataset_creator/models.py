@@ -71,16 +71,17 @@ class PlannedSlot(StrictModel):
 
 
 class DatasetPlan(StrictModel):
-    version: str = "1"
+    version: str = "2"
     project_name: str
     run_id: str
     config_hash: str
     seed: int
     created_at: str = Field(default_factory=utc_now)
     corpus_snapshot: str
-    documents: list[DocumentIndex]
-    reserve_document_ids: list[str]
-    slots: list[PlannedSlot]
+    database_path: str | None = None
+    documents: list[DocumentIndex] = Field(default_factory=list)
+    reserve_document_ids: list[str] = Field(default_factory=list)
+    slots: list[PlannedSlot] = Field(default_factory=list)
     estimates: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -153,7 +154,7 @@ class EvaluationResult(StrictModel):
 class RunManifest(StrictModel):
     run_id: str
     project_name: str
-    status: Literal["planned", "running", "completed", "partial", "failed"]
+    status: Literal["planned", "running", "completed", "partial", "failed", "interrupted"]
     config_path: str
     plan_path: str
     database_path: str
@@ -164,7 +165,7 @@ class RunManifest(StrictModel):
 
 class RunReport(StrictModel):
     run_id: str
-    status: Literal["completed", "partial", "failed"]
+    status: Literal["completed", "partial", "failed", "interrupted"]
     target_examples: int
     accepted_examples: int
     attempted_examples: int

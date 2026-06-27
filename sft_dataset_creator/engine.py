@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import platform
+import signal
 import threading
 import time
 from collections import defaultdict
@@ -13,9 +14,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from sft_dataset_creator.backends import BackendProcess, create_token_counter
+from sft_dataset_creator.checkpoints import CheckpointWriter
 from sft_dataset_creator.chunking import select_chunk
 from sft_dataset_creator.config import GenerationConfig, ProjectConfig
+from sft_dataset_creator.document_store import DocumentStore, LegacyDocumentStore, SQLiteDocumentStore
+from sft_dataset_creator.evaluators import deterministic_evaluation
 from sft_dataset_creator.exporters import export_run
+from sft_dataset_creator.locks import RunLock
 from sft_dataset_creator.metrics import GPUMonitor, stage_metrics
 from sft_dataset_creator.models import (
     DatasetPlan,
@@ -26,7 +31,8 @@ from sft_dataset_creator.models import (
     SFTCandidate,
     utc_now,
 )
-from sft_dataset_creator.planner import load_document_snapshot
+from sft_dataset_creator.progress import ProgressReporter
+from sft_dataset_creator.quality import candidate_fingerprint
 from sft_dataset_creator.registry import create
 from sft_dataset_creator.state import RunState
 
@@ -64,6 +70,7 @@ def _request_seed(seed: int, request_id: str) -> int:
 
 def _document_for_attempt(
     plan: DatasetPlan,
+    reserve_document_ids: Sequence[str],
     slot_id: str,
     original_id: str,
     attempt: int,
@@ -71,30 +78,36 @@ def _document_for_attempt(
     document_loads: dict[str, int],
     maximum: int,
 ) -> str:
-    if attempt <= same_attempts or not plan.reserve_document_ids:
+    if attempt <= same_attempts or not reserve_document_ids:
         return original_id
     digest = hashlib.sha256(f"{plan.seed}:{slot_id}:{attempt}".encode("utf-8")).digest()
-    start = int.from_bytes(digest[:8], "big") % len(plan.reserve_document_ids)
-    for offset in range(len(plan.reserve_document_ids)):
-        candidate = plan.reserve_document_ids[(start + offset) % len(plan.reserve_document_ids)]
+    start = int.from_bytes(digest[:8], "big") % len(reserve_document_ids)
+    for offset in range(len(reserve_document_ids)):
+        candidate = reserve_document_ids[(start + offset) % len(reserve_document_ids)]
         if document_loads.get(candidate, 0) < maximum:
             return candidate
     return original_id
 
 
-def _generation_jobs(state: RunState, plan: DatasetPlan, config: ProjectConfig) -> list[GenerationJob]:
+def _generation_jobs(
+    state: RunState,
+    plan: DatasetPlan,
+    config: ProjectConfig,
+    reserve_document_ids: Sequence[str],
+) -> list[GenerationJob]:
     maximum_attempts = math.ceil(config.target.examples * config.target.max_total_attempt_multiplier)
     remaining = maximum_attempts - state.counts()["attempted"]
     if remaining <= 0:
         return []
-    existing = state.attempt_keys()
-    document_loads = state.accepted_document_counts()
+    document_loads = state.accepted_document_counts() if reserve_document_ids else {}
     jobs: list[GenerationJob] = []
-    for slot, attempt in state.pending_slots(config.target.max_attempts_per_slot):
-        if (slot.id, attempt) in existing:
-            continue
+    for slot, attempt in state.pending_slots(
+        config.target.max_attempts_per_slot,
+        limit=min(config.runtime.checkpoint.scheduler_batch_size, remaining),
+    ):
         document_id = _document_for_attempt(
             plan,
+            reserve_document_ids,
             slot.id,
             slot.document_id,
             attempt,
@@ -112,7 +125,7 @@ def _generation_jobs(state: RunState, plan: DatasetPlan, config: ProjectConfig) 
 
 def _prepare_request_chunk(
     jobs: Sequence[GenerationJob],
-    documents: dict[str, Any],
+    documents: DocumentStore,
     config: GenerationConfig,
     language: str,
     plan_seed: int,
@@ -129,7 +142,7 @@ def _prepare_request_chunk(
                 index,
                 job,
                 select_chunk(
-                    documents[job.document_id],
+                    documents.get(job.document_id),
                     job.slot.chunk_id,
                     fallback_index=job.slot.ordinal + job.attempt - 2,
                 ),
@@ -164,7 +177,11 @@ def _prepare_request_chunk(
                     "request_id": job.request_id,
                     "seed": _request_seed(plan_seed, job.request_id),
                     "max_output_tokens": config.max_output_tokens,
-                    "metadata": {**request.metadata, "chunk_id": selected_chunk_id},
+                    "metadata": {
+                        **request.metadata,
+                        "chunk_id": selected_chunk_id,
+                        "document_title": document.title,
+                    },
                 }
             )
     return [request for request in prepared if request is not None]
@@ -172,22 +189,30 @@ def _prepare_request_chunk(
 
 def _request_stream(
     jobs: Sequence[GenerationJob],
-    documents: dict[str, Any],
+    documents: DocumentStore,
     config: GenerationConfig,
     language: str,
     plan_seed: int,
     counter: Any,
     prepared: dict[str, GenerationRequest],
     prepared_lock: threading.Lock,
+    progress: ProgressReporter | None,
+    stop_requested: threading.Event,
 ) -> Iterator[GenerationRequest]:
     size = config.batching.preparation_batch_size
     for start in range(0, len(jobs), size):
+        if stop_requested.is_set():
+            break
         requests = _prepare_request_chunk(
             jobs[start : start + size], documents, config, language, plan_seed, counter
         )
         for request in requests:
+            if stop_requested.is_set():
+                break
             with prepared_lock:
                 prepared[str(request.request_id)] = request
+            if progress is not None:
+                progress.set_current_request(request)
             yield request
 
 
@@ -254,7 +279,7 @@ def _aggregate_stage_metrics(rounds: Sequence[dict[str, Any]]) -> dict[str, Any]
 def _generate(
     state: RunState,
     jobs: Sequence[GenerationJob],
-    documents: dict[str, Any],
+    documents: DocumentStore,
     plan: DatasetPlan,
     config: ProjectConfig,
     callback: EventCallback | None,
@@ -262,10 +287,15 @@ def _generate(
     counter: Any,
     generator_process: BackendProcess | None = None,
     record_startup: bool = True,
+    progress: ProgressReporter | None = None,
+    stop_requested: threading.Event | None = None,
 ) -> dict[str, Any]:
     if not jobs:
         return _empty_stage_metrics()
+    stop_requested = stop_requested or threading.Event()
     _emit(callback, "generation_started", {"round": round_number, "slots": len(jobs)})
+    if progress is not None:
+        progress.set_phase("generating", current={"round": round_number, "batch_slots": len(jobs)})
     job_by_id = {job.request_id: job for job in jobs}
     prepared: dict[str, GenerationRequest] = {}
     prepared_lock = threading.Lock()
@@ -284,35 +314,42 @@ def _generate(
         if generator_process is not None
         else BackendProcess(config.generation)
     )
+    store_model_io = config.runtime.checkpoint.attempt_storage == "full" or config.runtime.store_model_io is True
     with backend_context as generator:
         startup_seconds = generator.startup_seconds if record_startup else 0.0
         monitor.start()
         started = time.perf_counter()
-        stream = _request_stream(
-            jobs,
-            documents,
-            config.generation,
-            config.language,
-            plan.seed,
-            counter,
-            prepared,
-            prepared_lock,
+        requests = list(
+            _request_stream(
+                jobs,
+                documents,
+                config.generation,
+                config.language,
+                plan.seed,
+                counter,
+                prepared,
+                prepared_lock,
+                progress,
+                stop_requested,
+            )
         )
+        if not requests:
+            return _empty_stage_metrics()
         try:
-            for result in generator.generate_many(stream):
+            for result in generator.generate_many(requests):
                 latencies.append(result.latency_seconds)
                 max_queue_depth = max(max_queue_depth, result.queue_depth)
                 job = job_by_id[result.request_id]
                 with prepared_lock:
                     request = prepared.pop(result.request_id, None)
-                document = documents[job.document_id]
+                document = documents.get(job.document_id)
                 if result.error is not None or result.response is None:
                     state.record_attempt(
                         None,
                         slot_id=job.slot.id,
                         attempt=job.attempt,
                         document_id=job.document_id,
-                        request_json=request.model_dump_json() if request and config.runtime.store_model_io else None,
+                        request_json=request.model_dump_json() if request and store_model_io else None,
                         error=result.error or "backend returned no response",
                         request_id=result.request_id,
                         latency_seconds=result.latency_seconds,
@@ -340,8 +377,8 @@ def _generate(
                         slot_id=job.slot.id,
                         attempt=job.attempt,
                         document_id=job.document_id,
-                        request_json=request.model_dump_json() if request and config.runtime.store_model_io else None,
-                        response_json=response.model_dump_json() if config.runtime.store_model_io else None,
+                        request_json=request.model_dump_json() if request and store_model_io else None,
+                        response_json=response.model_dump_json() if store_model_io else None,
                         request_id=result.request_id,
                         input_tokens=response.input_tokens,
                         output_tokens=response.output_tokens,
@@ -354,8 +391,8 @@ def _generate(
                         slot_id=job.slot.id,
                         attempt=job.attempt,
                         document_id=job.document_id,
-                        request_json=request.model_dump_json() if request and config.runtime.store_model_io else None,
-                        response_json=response.model_dump_json() if config.runtime.store_model_io else None,
+                        request_json=request.model_dump_json() if request and store_model_io else None,
+                        response_json=response.model_dump_json() if store_model_io else None,
                         error=str(exc),
                         request_id=result.request_id,
                         input_tokens=response.input_tokens,
@@ -364,13 +401,17 @@ def _generate(
                     )
                 input_tokens += response.input_tokens or 0
                 output_tokens += response.output_tokens or 0
+                if progress is not None:
+                    progress.write()
         finally:
             duration = time.perf_counter() - started
             gpu = monitor.stop()
+            if progress is not None:
+                progress.set_gpu_stats(gpu)
     _emit(callback, "generation_finished", {"round": round_number, "generated": generated})
     return {
         **stage_metrics(
-            requests=len(jobs),
+            requests=len(requests),
             duration_seconds=duration,
             startup_seconds=startup_seconds,
             input_tokens=input_tokens,
@@ -385,29 +426,45 @@ def _generate(
 
 def _evaluate_generated(
     state: RunState,
-    documents: dict[str, Any],
+    documents: DocumentStore,
     plan: DatasetPlan,
     config: ProjectConfig,
     callback: EventCallback | None,
     round_number: int,
+    checkpoint_writer: CheckpointWriter | None = None,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
-    strategy = create("evaluators", config.evaluation.plugin, config.evaluation)
-    ordinal = {slot.id: slot.ordinal for slot in plan.slots}
-    candidates = sorted(state.generated_candidates(), key=lambda value: (ordinal[value.slot_id], value.attempt))
+    candidates = list(state.generated_candidates_batch(config.runtime.checkpoint.scheduler_batch_size))
     if not candidates:
         return _empty_stage_metrics()
-    accepted = list(state.accepted_candidates())
-    accepted_slots = {candidate.slot_id for candidate in accepted}
+    _emit(callback, "evaluation_started", {"round": round_number, "candidates": len(candidates)})
+    if progress is not None:
+        progress.set_phase("evaluating", current={"round": round_number, "candidates": len(candidates)})
+    accepted_slots = state.accepted_slot_ids_for({candidate.slot_id for candidate in candidates})
+    accepted_this_batch: set[str] = set()
+    fingerprints_this_batch: set[str] = set()
     for candidate in candidates:
-        if candidate.slot_id in accepted_slots:
+        if candidate.slot_id in accepted_slots or candidate.slot_id in accepted_this_batch:
             state.mark_superseded(candidate)
             continue
-        document = documents[candidate.document_id]
-        evaluation = strategy.deterministic(candidate, document, accepted)
+        document = documents.get(candidate.document_id)
+        fingerprint = candidate_fingerprint(candidate.instruction, candidate.input, candidate.output)
+        duplicate = fingerprint in fingerprints_this_batch or state.accepted_fingerprint_exists(fingerprint)
+        evaluation = deterministic_evaluation(
+            candidate,
+            document,
+            [],
+            config.evaluation,
+            accepted_fingerprints={fingerprint} if duplicate else set(),
+        )
         state.record_evaluation(candidate, evaluation)
         if evaluation.verdict == "accept":
-            accepted.append(candidate)
-            accepted_slots.add(candidate.slot_id)
+            fingerprints_this_batch.add(fingerprint)
+            accepted_this_batch.add(candidate.slot_id)
+            if checkpoint_writer is not None:
+                checkpoint_writer.write(candidate)
+        if progress is not None:
+            progress.write()
     return {**_empty_stage_metrics(), "round": round_number}
 
 
@@ -422,19 +479,78 @@ def execute_plan(
     if plan.config_hash != config.config_hash:
         raise ValueError("plan and resolved configuration hashes do not match")
     target_dir = Path(run_dir) if run_dir else Path(plan.corpus_snapshot).parent
-    documents = load_document_snapshot(plan.corpus_snapshot)
     database = target_dir / "run.db"
-    _update_manifest(target_dir, "running")
+    stop_requested = threading.Event()
+    old_handlers: dict[int, Any] = {}
+
+    def request_stop(signum: int, _frame: Any) -> None:
+        stop_requested.set()
+        _emit(callback, "stop_requested", {"signal": signum})
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_stop)
+
+    try:
+        with RunLock(target_dir):
+            _update_manifest(target_dir, "running")
+            return _execute_locked(
+                plan,
+                config,
+                target_dir=target_dir,
+                database=database,
+                callback=callback,
+                auto_export=auto_export,
+                stop_requested=stop_requested,
+            )
+    finally:
+        for signum, handler in old_handlers.items():
+            signal.signal(signum, handler)
+
+
+def _execute_locked(
+    plan: DatasetPlan,
+    config: ProjectConfig,
+    *,
+    target_dir: Path,
+    database: Path,
+    callback: EventCallback | None,
+    auto_export: bool,
+    stop_requested: threading.Event,
+) -> RunReport:
     with RunState(database) as state:
         state.initialize(plan)
+        if state.document_count():
+            documents: DocumentStore = SQLiteDocumentStore(
+                target_dir,
+                state,
+                cache_size=config.runtime.checkpoint.document_cache_size,
+            )
+            reserve_document_ids = state.reserve_document_ids()
+        else:
+            documents = LegacyDocumentStore(plan.corpus_snapshot)
+            reserve_document_ids = plan.reserve_document_ids
+        progress = ProgressReporter(target_dir, config, state)
+        checkpoint_writer = CheckpointWriter(target_dir, state, config) if config.runtime.checkpoint.enabled else None
+        if checkpoint_writer is not None:
+            checkpoint_writer.catch_up()
         generation_rounds: list[dict[str, Any]] = []
         evaluation_rounds: list[dict[str, Any]] = []
-        recovered_metrics = _evaluate_generated(state, documents, plan, config, callback, 0)
+        recovered_metrics = _evaluate_generated(
+            state,
+            documents,
+            plan,
+            config,
+            callback,
+            0,
+            checkpoint_writer=checkpoint_writer,
+            progress=progress,
+        )
         if recovered_metrics["requests"]:
             evaluation_rounds.append(recovered_metrics)
         round_number = 0
         counts = state.counts()
-        jobs = _generation_jobs(state, plan, config)
+        jobs = _generation_jobs(state, plan, config, reserve_document_ids)
         counter = create_token_counter(config.generation) if jobs else None
 
         def execute_round(generator_process: BackendProcess | None = None) -> None:
@@ -452,26 +568,47 @@ def execute_plan(
                     counter,
                     generator_process=generator_process,
                     record_startup=generator_process is None or round_number == 1,
+                    progress=progress,
+                    stop_requested=stop_requested,
                 )
             )
             evaluation_rounds.append(
-                _evaluate_generated(state, documents, plan, config, callback, round_number)
+                _evaluate_generated(
+                    state,
+                    documents,
+                    plan,
+                    config,
+                    callback,
+                    round_number,
+                    checkpoint_writer=checkpoint_writer,
+                    progress=progress,
+                )
             )
             counts = state.counts()
             _emit(callback, "round_finished", {"round": round_number, **counts})
-            jobs = _generation_jobs(state, plan, config)
+            progress.write(force=True)
+            jobs = [] if stop_requested.is_set() else _generation_jobs(state, plan, config, reserve_document_ids)
 
         if jobs:
             with BackendProcess(config.generation) as generator_process:
-                while jobs and counts["accepted"] < config.target.examples:
+                while jobs and counts["accepted"] < config.target.examples and not stop_requested.is_set():
                     execute_round(generator_process)
+        if checkpoint_writer is not None:
+            checkpoint_writer.close()
 
         generation_metrics = _aggregate_stage_metrics(generation_rounds)
         evaluation_metrics = _aggregate_stage_metrics(evaluation_rounds)
         counts = state.counts()
-        status = "completed" if counts["accepted"] >= config.target.examples else "partial"
+        status = (
+            "interrupted"
+            if stop_requested.is_set()
+            else "completed"
+            if counts["accepted"] >= config.target.examples
+            else "partial"
+        )
         tokens = state.token_totals()
         state.event("run_finished", {"status": status, **counts})
+        progress.set_phase("finished", status=status)
         report = RunReport(
             run_id=plan.run_id,
             status=status,
@@ -495,7 +632,7 @@ def execute_plan(
         )
     (target_dir / "report.json").write_text(report.model_dump_json(indent=2), encoding="utf-8")
     _update_manifest(target_dir, status)
-    if auto_export:
+    if auto_export and status == "completed":
         export_run(target_dir, config=config)
     _emit(callback, "run_finished", report.model_dump(mode="json"))
     return report

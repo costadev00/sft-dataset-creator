@@ -28,6 +28,7 @@ hf = [
 ]
 openai = ["openai>=1.60,<3"]
 local = ["vllm>=0.20,<0.24"]
+dashboard = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
 dev = [
     "pytest>=8,<10",
     "pytest-cov>=6,<8",
@@ -38,6 +39,8 @@ all = [
     "pyarrow>=18,<24",
     "openai>=1.60,<3",
     "vllm>=0.20,<0.24",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.scripts]

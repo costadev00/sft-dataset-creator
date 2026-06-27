@@ -169,16 +169,37 @@ class OutputConfig(ConfigModel):
     splits: SplitConfig = Field(default_factory=SplitConfig)
 
 
+class CheckpointConfig(ConfigModel):
+    enabled: bool = True
+    formats: list[Literal["canonical", "messages", "prompt_completion", "alpaca"]] = Field(
+        default_factory=lambda: ["canonical", "messages", "prompt_completion", "alpaca"]
+    )
+    shard_size: int = Field(default=10_000, ge=1)
+    progress_interval_seconds: float = Field(default=15.0, gt=0.0)
+    scheduler_batch_size: int = Field(default=4_096, ge=1)
+    document_cache_size: int = Field(default=2_048, ge=1)
+    attempt_storage: Literal["compact", "full"] = "compact"
+
+
 class RuntimeConfig(ConfigModel):
     run_root: Path = Path("runs")
     cache_dir: Path = Path(".cache/sft-dataset-creator")
-    store_model_io: bool = True
+    store_model_io: bool | None = None
     fail_on_partial: bool = True
+    checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
 
     @field_validator("run_root", "cache_dir", mode="before")
     @classmethod
     def expand_path(cls, value: Any) -> Path:
         return Path(value).expanduser()
+
+    @model_validator(mode="after")
+    def apply_legacy_model_io(self) -> "RuntimeConfig":
+        if self.store_model_io is True:
+            self.checkpoint.attempt_storage = "full"
+        elif self.store_model_io is False and self.checkpoint.attempt_storage == "full":
+            self.checkpoint.attempt_storage = "compact"
+        return self
 
 
 class PublishConfig(ConfigModel):

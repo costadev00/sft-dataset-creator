@@ -16,3 +16,5 @@ runs/
 outputs/
 models/
 tmp/
+.codex
+.agents

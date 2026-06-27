@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -9,7 +10,7 @@ import typer
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from sft_dataset_creator.audit import create_audit_sample, score_audit
@@ -31,6 +32,7 @@ from sft_dataset_creator.config import (
 from sft_dataset_creator.doctor import attach_environment, collect_doctor_report
 from sft_dataset_creator.engine import execute_plan
 from sft_dataset_creator.exporters import export_run
+from sft_dataset_creator.checkpoints import CheckpointWriter
 from sft_dataset_creator.planner import build_plan, load_plan
 from sft_dataset_creator.publisher import publish_run
 from sft_dataset_creator.prompts import TASK_INSTRUCTIONS
@@ -439,7 +441,7 @@ def run_command(
     train_split: Annotated[float, typer.Option("--train-split", min=0.0, max=1.0)] = 1.0,
     validation_split: Annotated[float, typer.Option("--validation-split", min=0.0, max=1.0)] = 0.0,
     test_split: Annotated[float, typer.Option("--test-split", min=0.0, max=1.0)] = 0.0,
-    store_model_io: Annotated[bool, typer.Option("--store-model-io/--no-store-model-io")] = True,
+    store_model_io: Annotated[bool, typer.Option("--store-model-io/--no-store-model-io")] = False,
     fail_on_partial: Annotated[bool, typer.Option("--fail-on-partial/--allow-partial")] = True,
     smoke_models: Annotated[
         bool,
@@ -517,8 +519,16 @@ def run_command(
         dataset_plan = build_plan(value, run_dir=run_dir)
         root = Path(dataset_plan.corpus_snapshot).parent
     attach_environment(root, report)
-    progress = Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console)
-    task_id = progress.add_task("Starting run", total=None)
+    target_total = int(dataset_plan.estimates.get("planned_examples", value.target.examples))
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    task_id = progress.add_task("Starting run", total=target_total)
 
     def callback(kind: str, payload: dict) -> None:
         if kind == "generation_started":
@@ -526,28 +536,62 @@ def run_command(
         elif kind == "evaluation_started":
             progress.update(task_id, description=f"Evaluating {payload['candidates']} candidates")
         elif kind == "round_finished":
-            progress.update(task_id, description=f"Round {payload['round']}: {payload['accepted']}/{payload['target']} accepted")
+            progress.update(
+                task_id,
+                completed=payload["accepted"],
+                description=(
+                    f"Round {payload['round']}: {payload['accepted']}/{payload['target']} accepted "
+                    f"({payload.get('attempted', 0)} attempts)"
+                ),
+            )
+        elif kind == "stop_requested":
+            progress.update(task_id, description=f"Stopping after signal {payload['signal']}...")
 
     with progress:
         result = execute_plan(dataset_plan, value, run_dir=root, callback=callback)
     console.print(Panel.fit(result.model_dump_json(indent=2), title="Run report"))
-    if result.status == "partial" and value.runtime.fail_on_partial:
+    if result.status in {"partial", "interrupted"} and value.runtime.fail_on_partial:
         raise typer.Exit(4)
 
 
 @app.command("status")
-def status_command(run_dir: Annotated[Path, typer.Argument()]) -> None:
+def status_command(
+    run_dir: Annotated[Path, typer.Argument()],
+    watch: Annotated[bool, typer.Option("--watch", help="Refresh status until interrupted")] = False,
+    interval: Annotated[float, typer.Option("--interval", min=1.0)] = 5.0,
+) -> None:
     """Show resumable run counters and the latest report."""
+    if not watch:
+        _print_status(run_dir)
+        return
+    try:
+        while True:
+            console.clear()
+            _print_status(run_dir)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return
+
+
+def _print_status(run_dir: Path) -> None:
     with RunState(run_dir / "run.db") as state:
-        counts = state.counts()
+        config = load_config(run_dir / "config.resolved.json")
+        counts = state.progress_counts(config.target.max_attempts_per_slot)
         deficits = state.deficits()
+        shards = state.checkpoint_shards()
     table = Table(title=f"Run status: {run_dir.name}")
-    table.add_column("Target")
-    table.add_column("Accepted")
-    table.add_column("Attempted")
-    table.add_column("Rejected")
-    table.add_column("Speculative")
-    table.add_row(*(str(counts[key]) for key in ("target", "accepted", "attempted", "rejected", "speculative")))
+    for column in ("Target", "Accepted", "Attempted", "Rejected", "Errors", "Pending", "Exhausted", "Shards"):
+        table.add_column(column)
+    table.add_row(
+        str(counts["target"]),
+        str(counts["accepted"]),
+        str(counts["attempted"]),
+        str(counts["rejected"]),
+        str(counts["errors"]),
+        str(counts["pending"]),
+        str(counts["exhausted"]),
+        str(len(shards)),
+    )
     console.print(table)
     if deficits:
         console.print_json(json.dumps(deficits))
@@ -575,6 +619,33 @@ def export_command(run_dir: Annotated[Path, typer.Argument()]) -> None:
     """Regenerate configured output views from accepted canonical records."""
     target = export_run(run_dir)
     console.print(f"[green]Exports written:[/green] {target}")
+
+
+@app.command("checkpoint")
+def checkpoint_command(run_dir: Annotated[Path, typer.Argument()]) -> None:
+    """Write missing incremental checkpoint shards from accepted records."""
+    config = load_config(run_dir / "config.resolved.json")
+    with RunState(run_dir / "run.db") as state:
+        writer = CheckpointWriter(run_dir, state, config)
+        written = writer.catch_up()
+    console.print(f"[green]Checkpoint catch-up complete:[/green] {written} accepted candidates processed")
+
+
+@app.command("dashboard")
+def dashboard_command(
+    run_dir: Annotated[Path, typer.Argument()],
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8765,
+) -> None:
+    """Serve a read-only local dashboard for a run."""
+    try:
+        import uvicorn
+        from sft_dataset_creator.dashboard import create_dashboard_app
+    except ImportError as exc:
+        raise typer.BadParameter("install the dashboard extra: python -m pip install -e '.[dashboard]'") from exc
+    app_value = create_dashboard_app(run_dir)
+    console.print(f"[green]Dashboard:[/green] http://{host}:{port}")
+    uvicorn.run(app_value, host=host, port=port)
 
 
 @app.command("audit-sample")

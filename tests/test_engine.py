@@ -10,10 +10,11 @@ from sft_dataset_creator.config import (
     GenerationConfig,
     PerDocumentConfig,
     SourceConfig,
+    save_config,
 )
 from sft_dataset_creator.engine import execute_plan
 from sft_dataset_creator.exporters import export_run
-from sft_dataset_creator.models import EvaluationResult
+from sft_dataset_creator.models import DatasetPlan, Document, EvaluationResult, PlannedSlot, RunManifest
 from sft_dataset_creator.planner import build_plan
 from sft_dataset_creator.state import RunState
 
@@ -30,6 +31,78 @@ def test_fake_backend_executes_and_resumes(project_config, tmp_path) -> None:
     assert second.attempted_examples == report.attempted_examples
     with RunState(run_dir / "run.db") as state:
         assert len(list(state.accepted_candidates())) == 4
+
+
+def test_legacy_v1_plan_still_executes(project_config, tmp_path) -> None:
+    config = project_config.model_copy(
+        update={
+            "target": project_config.target.model_copy(
+                update={
+                    "examples": 1,
+                    "reserve_fraction": 0.0,
+                    "max_attempts_per_slot": 1,
+                    "max_total_attempt_multiplier": 1.0,
+                }
+            ),
+            "composition": project_config.composition.model_copy(
+                update={
+                    "tasks": DistributionConfig(counts={"closed_qa": 1}),
+                    "difficulties": DistributionConfig(counts={"easy": 1}),
+                }
+            ),
+        }
+    )
+    run_dir = tmp_path / "legacy-v1"
+    run_dir.mkdir()
+    config_path = save_config(config, run_dir / "config.resolved.json")
+    snapshot_path = run_dir / "corpus-selected.jsonl"
+    snapshot_path.write_text(
+        Document(
+            id="legacy-doc",
+            source="test",
+            title="Legacy Doc",
+            text="Legacy document contains enough grounded factual passage for a supervised test example.",
+        ).model_dump_json()
+        + "\n",
+        encoding="utf-8",
+    )
+    plan = DatasetPlan(
+        version="1",
+        project_name=config.name,
+        run_id="legacy-v1",
+        config_hash=config.config_hash,
+        seed=config.selection.seed,
+        corpus_snapshot=str(snapshot_path),
+        reserve_document_ids=[],
+        slots=[
+            PlannedSlot(
+                id="slot-00000001",
+                document_id="legacy-doc",
+                task="closed_qa",
+                difficulty="easy",
+                ordinal=1,
+                chunk_id="0",
+            )
+        ],
+    )
+    plan_path = run_dir / "plan.json"
+    plan_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        RunManifest(
+            run_id=plan.run_id,
+            project_name=config.name,
+            status="planned",
+            config_path=str(config_path),
+            plan_path=str(plan_path),
+            database_path=str(run_dir / "run.db"),
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+    report = execute_plan(plan, config, run_dir=run_dir)
+
+    assert report.status == "completed"
+    assert report.accepted_examples == 1
 
 
 def test_final_exports_do_not_leak_documents_between_splits(project_config, tmp_path) -> None:
@@ -117,8 +190,8 @@ def test_multiple_examples_from_document_iterate_over_chunks(project_config, tmp
     report = execute_plan(plan, config, run_dir=run_dir)
 
     assert report.accepted_examples == 3
-    assert [slot.chunk_id for slot in plan.slots] == ["0", "1", "2"]
     with RunState(run_dir / "run.db") as state:
+        assert [slot.chunk_id for slot in state.slots()] == ["0", "1", "2"]
         assert [candidate.evidence[0].section_id for candidate in state.accepted_candidates()] == ["0", "1", "2"]
 
 

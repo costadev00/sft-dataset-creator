@@ -8,6 +8,7 @@ from sft_dataset_creator.config import (
     CorpusSelection,
     EvaluationConfig,
     ProjectConfig,
+    RuntimeConfig,
     load_config,
     save_config,
 )
@@ -39,3 +40,8 @@ def test_quality_gates_cannot_be_disabled() -> None:
         CompositionConfig(grounding_required=False)
     with pytest.raises(ValidationError):
         EvaluationConfig(deterministic=False)
+
+
+def test_legacy_store_model_io_maps_to_attempt_storage() -> None:
+    assert RuntimeConfig(store_model_io=True).checkpoint.attempt_storage == "full"
+    assert RuntimeConfig(store_model_io=False).checkpoint.attempt_storage == "compact"
