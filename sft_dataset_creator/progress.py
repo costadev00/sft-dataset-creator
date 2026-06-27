@@ -37,6 +37,8 @@ class ProgressReporter:
             self.status = status
         if current is not None:
             self.current = current
+        elif phase == "finished":
+            self.current = {}
         self.write(force=True)
 
     def set_current_request(self, request: GenerationRequest) -> None:
@@ -70,7 +72,8 @@ class ProgressReporter:
         accepted_rate = (accepted - first[1]) / window if len(self.recent_rates) > 1 else accepted / elapsed
         attempt_rate = (attempted - first[2]) / window if len(self.recent_rates) > 1 else attempted / elapsed
         remaining = max(0, target - accepted)
-        eta_seconds = remaining / accepted_rate if accepted_rate > 0 else None
+        terminal = self.phase == "finished" or self.status in {"completed", "partial", "interrupted", "failed"}
+        eta_seconds = None if terminal else remaining / accepted_rate if accepted_rate > 0 else None
         payload = {
             "phase": self.phase,
             "status": self.status,

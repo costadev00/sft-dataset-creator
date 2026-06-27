@@ -9,6 +9,20 @@ from sft_dataset_creator.models import DatasetPlan, EvaluationResult, PlannedSlo
 from sft_dataset_creator.quality import candidate_fingerprint
 
 
+def _friendly_attempt_reason(error: str | None, issues: list[str], status: str) -> str:
+    if error:
+        if "JSONDecodeError" in error:
+            return "Resposta do modelo nao foi um JSON valido"
+        if "ValidationError" in error or "Pydantic" in error:
+            return "Resposta fora do schema esperado"
+        if "backend returned no response" in error:
+            return "Backend nao retornou resposta"
+        return error.splitlines()[0]
+    if issues:
+        return ", ".join(issues)
+    return status
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS slots (
     id TEXT PRIMARY KEY,
@@ -571,6 +585,43 @@ class RunState:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def recent_rejections(self, limit: int = 20) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT a.candidate_id, a.slot_id, a.attempt_no, a.document_id, a.status, a.error, "
+            "a.evaluation_json, a.created_at, d.title, s.task, s.difficulty "
+            "FROM attempts a "
+            "LEFT JOIN documents d ON d.id = a.document_id "
+            "LEFT JOIN slots s ON s.id = a.slot_id "
+            "WHERE a.status IN ('reject', 'error') OR (a.error IS NOT NULL AND a.status != 'accept') "
+            "ORDER BY a.created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        output: list[dict] = []
+        for row in rows:
+            issues: list[str] = []
+            if row["evaluation_json"]:
+                try:
+                    issues = list(json.loads(row["evaluation_json"]).get("issues") or [])
+                except (TypeError, json.JSONDecodeError):
+                    issues = []
+            reason = _friendly_attempt_reason(row["error"], issues, str(row["status"]))
+            output.append(
+                {
+                    "candidate_id": row["candidate_id"],
+                    "slot_id": row["slot_id"],
+                    "attempt_no": row["attempt_no"],
+                    "document_id": row["document_id"],
+                    "title": row["title"] or row["document_id"],
+                    "task": row["task"],
+                    "difficulty": row["difficulty"],
+                    "status": row["status"],
+                    "reason": reason,
+                    "issues": issues,
+                    "created_at": row["created_at"],
+                }
+            )
+        return output
+
     def recent_accepted(self, limit: int = 20) -> list[SFTCandidate]:
         rows = self.connection.execute(
             "SELECT accepted_candidate FROM slots WHERE status = 'accepted' "
@@ -578,3 +629,21 @@ class RunState:
             (limit,),
         ).fetchall()
         return [SFTCandidate.model_validate_json(row["accepted_candidate"]) for row in rows]
+
+    def recent_successes(self, limit: int = 20) -> list[dict]:
+        output: list[dict] = []
+        for candidate in self.recent_accepted(limit):
+            output.append(
+                {
+                    "candidate_id": candidate.id,
+                    "slot_id": candidate.slot_id,
+                    "attempt_no": candidate.attempt,
+                    "document_id": candidate.document_id,
+                    "title": candidate.source_title or candidate.document_id,
+                    "task": candidate.task,
+                    "difficulty": candidate.difficulty,
+                    "question": candidate.instruction,
+                    "answer": candidate.output,
+                }
+            )
+        return output
