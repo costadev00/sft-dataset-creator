@@ -25,5 +25,11 @@ def publish_output(
         repo_type="dataset",
         folder_path=output_dir,
         commit_message="Publish reconstructed unchunked dataset",
+        delete_patterns=[
+            "data/train.parquet",
+            "data/train-*.parquet",
+            "reports/*",
+            "README.md",
+        ],
     )
     return f"https://huggingface.co/datasets/{repo_id}"

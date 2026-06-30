@@ -28,13 +28,22 @@ def _parse_csv(value: str | None) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
-def _write_parquet(path: Path, rows: list[dict[str, object]], text_column: str) -> None:
+def _write_parquet(
+    path: Path,
+    rows: list[dict[str, object]],
+    text_column: str,
+    *,
+    rows_per_shard: int,
+    row_group_size: int,
+) -> list[Path]:
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise ImportError("writing parquet requires pyarrow") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
+    for stale in path.parent.glob(f"{path.stem}*.parquet"):
+        stale.unlink()
     if rows:
         columns: list[str] = []
         seen: set[str] = set()
@@ -44,7 +53,20 @@ def _write_parquet(path: Path, rows: list[dict[str, object]], text_column: str) 
                     seen.add(key)
                     columns.append(key)
         normalized = [{column: row.get(column) for column in columns} for row in rows]
-        table = pa.Table.from_pylist(normalized)
+        written: list[Path] = []
+        if len(normalized) <= rows_per_shard:
+            table = pa.Table.from_pylist(normalized)
+            pq.write_table(table, path, row_group_size=row_group_size)
+            return [path]
+        shard_count = (len(normalized) + rows_per_shard - 1) // rows_per_shard
+        for shard_index in range(shard_count):
+            start = shard_index * rows_per_shard
+            shard_rows = normalized[start : start + rows_per_shard]
+            shard_path = path.with_name(f"{path.stem}-{shard_index:05d}-of-{shard_count:05d}{path.suffix}")
+            table = pa.Table.from_pylist(shard_rows)
+            pq.write_table(table, shard_path, row_group_size=row_group_size)
+            written.append(shard_path)
+        return written
     else:
         table = pa.table(
             {
@@ -55,7 +77,8 @@ def _write_parquet(path: Path, rows: list[dict[str, object]], text_column: str) 
                 "reconstruction_status": pa.array([], type=pa.string()),
             }
         )
-    pq.write_table(table, path)
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return [path]
 
 
 @app.command("unchunk")
@@ -88,6 +111,8 @@ def unchunk_command(
     source_split_column: Annotated[str, typer.Option("--source-split-column")] = "split",
     drop_columns: Annotated[str, typer.Option("--drop-columns", help="Comma-separated extra chunk metadata columns.")] = "token_count",
     max_groups: Annotated[int | None, typer.Option("--max-groups", min=1)] = None,
+    rows_per_shard: Annotated[int, typer.Option("--rows-per-shard", min=1)] = 10_000,
+    row_group_size: Annotated[int, typer.Option("--row-group-size", min=1)] = 1_000,
     token_env: Annotated[str, typer.Option("--token-env")] = "HF_TOKEN",
 ) -> None:
     """Reconstruct full rows from chunked dataset rows."""
@@ -157,7 +182,13 @@ def unchunk_command(
     )
 
     output.output_dir.mkdir(parents=True, exist_ok=True)
-    _write_parquet(output.output_dir / "data" / "train.parquet", reconstructed_rows, config.text_column)
+    parquet_paths = _write_parquet(
+        output.output_dir / "data" / "train.parquet",
+        reconstructed_rows,
+        config.text_column,
+        rows_per_shard=rows_per_shard,
+        row_group_size=row_group_size,
+    )
     write_json(output.output_dir / "reports" / "reconstruction_report.json", report)
     write_quarantine(output.output_dir / "reports" / "quarantined_groups.jsonl", quarantined)
     (output.output_dir / "README.md").write_text(dataset_card(report), encoding="utf-8")
@@ -165,7 +196,7 @@ def unchunk_command(
     typer.echo(
         "Wrote "
         f"{len(reconstructed_rows)} reconstructed rows and {len(quarantined)} quarantined groups "
-        f"to {output.output_dir}."
+        f"to {output.output_dir} across {len(parquet_paths)} parquet file(s)."
     )
     if output.no_push or not output.output_repo_id:
         return
