@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataset-unchunker"
+version = "0.1.0"
+description = "Generic CLI and library for reconstructing chunked Hugging Face datasets."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3,<5",
+    "huggingface_hub>=0.30,<2",
+    "pyarrow>=18,<24",
+    "transformers>=4,<6",
+    "typer>=0.15,<1",
+]
+
+[project.scripts]
+dataset-unchunker = "dataset_unchunker.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["dataset_unchunker*"]

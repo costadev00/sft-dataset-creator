@@ -180,6 +180,173 @@ Parametros opcionais para experimentar throughput:
 --generator-param gpu_memory_utilization=0.92
 ```
 
+## Run de 20% da `wikipedia-pt-br-extract`
+
+Para rodar 20% dos documentos elegiveis do dataset
+`costadev00/wikipedia-pt-br-extract`, fixe a revisao e conte os elegiveis antes
+de chamar `run`. Esse dataset pode ser gated no Hugging Face; a maquina precisa
+estar autenticada e com o acesso aceito.
+
+Preparacao:
+
+```bash
+cd /home/matheuscm/sft-dataset-creator
+source .venv/bin/activate
+python -m pip install -e '.[hf,local,dashboard]'
+hf auth login || huggingface-cli login
+
+export DATASET_ID="costadev00/wikipedia-pt-br-extract"
+export DATASET_REVISION="cdbd07dc4a3de6e64632c718710b3ae0ebaeb0ff"
+```
+
+Preflight para calcular `SELECTED_DOCS` e `RECOMMENDED_EXAMPLES`:
+
+```bash
+mkdir -p runs
+.venv/bin/sft-dataset preflight \
+  --dataset "$DATASET_ID" \
+  --dataset-revision "$DATASET_REVISION" \
+  --source huggingface \
+  --split train \
+  --streaming \
+  --profile wikipedia_ptbr \
+  --id-field page_id \
+  --text-field text \
+  --title-field title \
+  --sections-field section_texts \
+  --license-field license \
+  --selection-fraction 0.2 \
+  --per-document-min 14 \
+  --per-document-max 14 \
+  --progress-every 100000 \
+  --shell | tee runs/wiki-ptbr-extract-20pct.preflight.env
+
+source runs/wiki-ptbr-extract-20pct.preflight.env
+export EXAMPLES="$RECOMMENDED_EXAMPLES"
+```
+
+Argumentos comuns da distribuicao:
+
+```bash
+TASK_ARGS=(
+  --task classification=1
+  --task closed_qa=1
+  --task comparison=1
+  --task concept_explanation=1
+  --task definition=1
+  --task didactic_explanation=1
+  --task fact_checking=1
+  --task information_extraction=1
+  --task rewrite=1
+  --task short_answer=1
+  --task structured_extraction=1
+  --task summarization=1
+  --task taxonomy=1
+  --task timeline=1
+)
+
+DIFFICULTY_ARGS=(
+  --difficulty easy=0.25
+  --difficulty medium=0.5
+  --difficulty hard=0.25
+)
+```
+
+Calibracao com 5.000 documentos, mantendo 14 slots por documento:
+
+```bash
+export CALIB_DOCS=5000
+export CALIB_EXAMPLES=$((CALIB_DOCS * 14))
+export CALIB_RUN_DIR="runs/wiki-ptbr-extract-calib-5kdocs-14tasks"
+
+.venv/bin/sft-dataset run \
+  --dataset "$DATASET_ID" \
+  --dataset-revision "$DATASET_REVISION" \
+  --source huggingface \
+  --split train \
+  --streaming \
+  --language pt-BR \
+  --profile wikipedia_ptbr \
+  --id-field page_id \
+  --text-field text \
+  --title-field title \
+  --sections-field section_texts \
+  --license-field license \
+  --documents "$CALIB_DOCS" \
+  --examples "$CALIB_EXAMPLES" \
+  --reserve-fraction 0 \
+  --per-document-min 14 \
+  --per-document-max 14 \
+  --max-attempts 5 \
+  --attempt-multiplier 3 \
+  "${TASK_ARGS[@]}" \
+  "${DIFFICULTY_ARGS[@]}" \
+  --generator-plugin vllm_local \
+  --model google/gemma-4-31B-it-qat-w4a16-ct \
+  --formats messages,prompt_completion,alpaca \
+  --containers jsonl \
+  --run-dir "$CALIB_RUN_DIR" \
+  --allow-partial
+```
+
+Run principal:
+
+```bash
+export RUN_DIR="runs/wiki-ptbr-extract-20pct-14tasks"
+
+.venv/bin/sft-dataset run \
+  --dataset "$DATASET_ID" \
+  --dataset-revision "$DATASET_REVISION" \
+  --source huggingface \
+  --split train \
+  --streaming \
+  --language pt-BR \
+  --profile wikipedia_ptbr \
+  --id-field page_id \
+  --text-field text \
+  --title-field title \
+  --sections-field section_texts \
+  --license-field license \
+  --selection-fraction 0.2 \
+  --examples "$EXAMPLES" \
+  --reserve-fraction 0 \
+  --per-document-min 14 \
+  --per-document-max 14 \
+  --max-attempts 5 \
+  --attempt-multiplier 3 \
+  "${TASK_ARGS[@]}" \
+  "${DIFFICULTY_ARGS[@]}" \
+  --generator-plugin vllm_local \
+  --model google/gemma-4-31B-it-qat-w4a16-ct \
+  --formats messages,prompt_completion,alpaca \
+  --containers jsonl \
+  --run-dir "$RUN_DIR" \
+  --allow-partial
+```
+
+Acompanhamento:
+
+```bash
+.venv/bin/sft-dataset status "$RUN_DIR" --watch --interval 10
+.venv/bin/sft-dataset dashboard "$RUN_DIR" --host 127.0.0.1 --port 8765
+```
+
+De outra maquina local, tunel SSH:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 usuario@IP_DA_S10
+```
+
+Abra `http://127.0.0.1:8765` no navegador local.
+
+Finalizacao:
+
+```bash
+.venv/bin/sft-dataset checkpoint "$RUN_DIR"
+.venv/bin/sft-dataset export "$RUN_DIR"
+cat "$RUN_DIR/report.json"
+```
+
 ## Perfil E: mais ou menos GPUs que a maquina principal
 
 Com 2 GPUs:

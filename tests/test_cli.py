@@ -180,6 +180,125 @@ def test_cli_run_rejects_unknown_task(corpus_path) -> None:
     assert "unknown --task value(s): not-a-task" in result.output
 
 
+def test_cli_preflight_computes_examples_from_document_count(corpus_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "preflight",
+            "--dataset",
+            str(corpus_path),
+            "--source",
+            "local",
+            "--documents",
+            "4",
+            "--per-document-min",
+            "14",
+            "--per-document-max",
+            "14",
+            "--progress-every",
+            "0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "TOTAL_ROWS=8" in result.output
+    assert "ELIGIBLE_DOCS=8" in result.output
+    assert "SELECTED_DOCS=4" in result.output
+    assert "RECOMMENDED_EXAMPLES=56" in result.output
+
+
+def test_cli_preflight_computes_examples_from_selection_fraction(corpus_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "preflight",
+            "--dataset",
+            str(corpus_path),
+            "--source",
+            "local",
+            "--selection-fraction",
+            "0.25",
+            "--per-document-min",
+            "14",
+            "--per-document-max",
+            "14",
+            "--progress-every",
+            "0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "TOTAL_ROWS=8" in result.output
+    assert "ELIGIBLE_DOCS=8" in result.output
+    assert "SELECTED_DOCS=2" in result.output
+    assert "RECOMMENDED_EXAMPLES=28" in result.output
+
+
+def test_cli_preflight_shell_output_is_machine_readable(corpus_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "preflight",
+            "--dataset",
+            str(corpus_path),
+            "--source",
+            "local",
+            "--selection-fraction",
+            "0.25",
+            "--per-document-min",
+            "14",
+            "--per-document-max",
+            "14",
+            "--shell",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines() == [
+        "TOTAL_ROWS=8",
+        "ELIGIBLE_DOCS=8",
+        "SELECTED_DOCS=2",
+        "PER_DOCUMENT_MIN=14",
+        "PER_DOCUMENT_MAX=14",
+        "MINIMUM_EXAMPLES=28",
+        "MAXIMUM_EXAMPLES=28",
+        "RECOMMENDED_EXAMPLES=28",
+    ]
+
+
+def test_cli_preflight_rejects_multiple_selection_sizes(corpus_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "preflight",
+            "--dataset",
+            str(corpus_path),
+            "--source",
+            "local",
+            "--documents",
+            "2",
+            "--selection-fraction",
+            "0.25",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "use only one of --documents or --selection-fraction" in result.output
+
+
+def test_cli_preflight_rejects_zero_selection_fraction(corpus_path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "preflight",
+            "--dataset",
+            str(corpus_path),
+            "--source",
+            "local",
+            "--selection-fraction",
+            "0",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--selection-fraction must be greater than zero" in result.output
+
+
 def test_cli_tune_writes_profile_artifacts(project_config, tmp_path) -> None:
     config_path = save_config(project_config, tmp_path / "project.json")
     output = tmp_path / "project.tuned.json"

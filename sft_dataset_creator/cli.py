@@ -34,6 +34,7 @@ from sft_dataset_creator.engine import execute_plan
 from sft_dataset_creator.exporters import export_run
 from sft_dataset_creator.checkpoints import CheckpointWriter
 from sft_dataset_creator.planner import build_plan, load_plan
+from sft_dataset_creator.preflight import count_preflight
 from sft_dataset_creator.publisher import publish_run
 from sft_dataset_creator.prompts import TASK_INSTRUCTIONS
 from sft_dataset_creator.registry import available_plugins
@@ -137,6 +138,56 @@ def _project_name(dataset: str) -> str:
     return normalized.strip("-") or "synthetic-sft"
 
 
+def _source_config_from_options(
+    *,
+    dataset: str,
+    dataset_revision: str | None,
+    source_plugin: str,
+    subset: str | None,
+    split: str,
+    streaming: bool,
+    source_format: str | None,
+    cache_dir: Path,
+    id_field: str,
+    text_field: str,
+    title_field: str,
+    sections_field: str,
+    license_field: str,
+) -> SourceConfig:
+    if dataset_revision and dataset_revision.strip().upper() == "DATASET_COMMIT_SHA":
+        raise typer.BadParameter(
+            "replace DATASET_COMMIT_SHA with a real Hugging Face revision or omit --dataset-revision"
+        )
+    if source_plugin == "huggingface":
+        source_params: dict[str, Any] = {
+            "dataset": dataset,
+            "split": split,
+            "streaming": streaming,
+            "cache_dir": str(cache_dir),
+        }
+        if subset is not None:
+            source_params["subset"] = subset
+        if dataset_revision is not None:
+            source_params["revision"] = dataset_revision
+    elif source_plugin == "local":
+        source_params = {"path": dataset}
+        if source_format is not None:
+            source_params["format"] = source_format
+    else:
+        raise typer.BadParameter("--source must be 'huggingface' or 'local'")
+    return SourceConfig(
+        plugin=source_plugin,
+        params=source_params,
+        field_map={
+            "id": id_field,
+            "text": text_field,
+            "title": title_field,
+            "sections": sections_field,
+            "license": license_field,
+        },
+    )
+
+
 def _direct_config(
     *,
     dataset: str,
@@ -182,32 +233,26 @@ def _direct_config(
 ) -> ProjectConfig:
     if document_count is not None and selection_fraction is not None:
         raise typer.BadParameter("use only one of --documents or --selection-fraction")
-    if dataset_revision and dataset_revision.strip().upper() == "DATASET_COMMIT_SHA":
-        raise typer.BadParameter(
-            "replace DATASET_COMMIT_SHA with a real Hugging Face revision or omit --dataset-revision"
-        )
     selection = (
         CorpusSelection(count=document_count, seed=seed)
         if document_count is not None
         else CorpusSelection(fraction=selection_fraction if selection_fraction is not None else 1.0, seed=seed)
     )
-    if source_plugin == "huggingface":
-        source_params: dict[str, Any] = {
-            "dataset": dataset,
-            "split": split,
-            "streaming": streaming,
-            "cache_dir": str(cache_dir),
-        }
-        if subset is not None:
-            source_params["subset"] = subset
-        if dataset_revision is not None:
-            source_params["revision"] = dataset_revision
-    elif source_plugin == "local":
-        source_params = {"path": dataset}
-        if source_format is not None:
-            source_params["format"] = source_format
-    else:
-        raise typer.BadParameter("--source must be 'huggingface' or 'local'")
+    source_config = _source_config_from_options(
+        dataset=dataset,
+        dataset_revision=dataset_revision,
+        source_plugin=source_plugin,
+        subset=subset,
+        split=split,
+        streaming=streaming,
+        source_format=source_format,
+        cache_dir=cache_dir,
+        id_field=id_field,
+        text_field=text_field,
+        title_field=title_field,
+        sections_field=sections_field,
+        license_field=license_field,
+    )
 
     generation_params = _model_params(
         generator_params,
@@ -229,17 +274,7 @@ def _direct_config(
         name=name or _project_name(dataset),
         language=language,
         profile=profile,
-        source=SourceConfig(
-            plugin=source_plugin,
-            params=source_params,
-            field_map={
-                "id": id_field,
-                "text": text_field,
-                "title": title_field,
-                "sections": sections_field,
-                "license": license_field,
-            },
-        ),
+        source=source_config,
         selection=selection,
         target=TargetConfig(
             examples=examples,
@@ -384,6 +419,109 @@ def plan_command(
     )
     console.print(table)
     console.print(f"[green]Plan written:[/green] {root / 'plan.json'}")
+
+
+@app.command("preflight")
+def preflight_command(
+    dataset: Annotated[
+        str,
+        typer.Option("--dataset", help="Hugging Face dataset id or local corpus path"),
+    ],
+    dataset_revision: Annotated[
+        str | None,
+        typer.Option("--dataset-revision", help="Pinned Hugging Face commit, tag, or branch"),
+    ] = None,
+    source_plugin: Annotated[str, typer.Option("--source", help="huggingface or local")] = "huggingface",
+    subset: Annotated[str | None, typer.Option("--subset")] = None,
+    split: Annotated[str, typer.Option("--split")] = "train",
+    streaming: Annotated[bool, typer.Option("--streaming/--no-streaming")] = True,
+    source_format: Annotated[str | None, typer.Option("--source-format", help="json, jsonl, or parquet")] = None,
+    cache_dir: Annotated[Path, typer.Option("--cache-dir")] = Path(".cache/sft-dataset-creator"),
+    id_field: Annotated[str, typer.Option("--id-field")] = "id",
+    text_field: Annotated[str, typer.Option("--text-field")] = "text",
+    title_field: Annotated[str, typer.Option("--title-field")] = "title",
+    sections_field: Annotated[str, typer.Option("--sections-field")] = "sections",
+    license_field: Annotated[str, typer.Option("--license-field")] = "license",
+    document_count: Annotated[int | None, typer.Option("--documents", min=1)] = None,
+    selection_fraction: Annotated[float | None, typer.Option("--selection-fraction", min=0.0, max=1.0)] = None,
+    profile: Annotated[str | None, typer.Option("--profile")] = None,
+    per_document_minimum: Annotated[int, typer.Option("--per-document-min", min=0)] = 1,
+    per_document_maximum: Annotated[int, typer.Option("--per-document-max", min=1)] = 3,
+    progress_every: Annotated[
+        int,
+        typer.Option("--progress-every", min=0, help="Print scanned/eligible counters every N rows; 0 disables"),
+    ] = 100_000,
+    shell: Annotated[bool, typer.Option("--shell", help="Print only shell-compatible KEY=VALUE lines")] = False,
+) -> None:
+    """Count eligible documents and compute examples for a large direct run."""
+    if document_count is not None and selection_fraction is not None:
+        raise typer.BadParameter("use only one of --documents or --selection-fraction")
+    if selection_fraction is not None and selection_fraction <= 0.0:
+        raise typer.BadParameter("--selection-fraction must be greater than zero")
+    if per_document_minimum > per_document_maximum:
+        raise typer.BadParameter("--per-document-min cannot exceed --per-document-max")
+    _configure_cache_environment(cache_dir)
+    source_config = _source_config_from_options(
+        dataset=dataset,
+        dataset_revision=dataset_revision,
+        source_plugin=source_plugin,
+        subset=subset,
+        split=split,
+        streaming=streaming,
+        source_format=source_format,
+        cache_dir=cache_dir,
+        id_field=id_field,
+        text_field=text_field,
+        title_field=title_field,
+        sections_field=sections_field,
+        license_field=license_field,
+    )
+
+    progress_console = Console(stderr=shell)
+
+    def progress_callback(total: int, eligible: int) -> None:
+        progress_console.print(f"scanned={total:,} eligible={eligible:,}")
+
+    result = count_preflight(
+        source_config,
+        profile=profile,
+        document_count=document_count,
+        selection_fraction=selection_fraction,
+        per_document_minimum=per_document_minimum,
+        per_document_maximum=per_document_maximum,
+        progress_every=progress_every,
+        progress_callback=progress_callback,
+    )
+
+    lines = [
+        f"TOTAL_ROWS={result.total_rows}",
+        f"ELIGIBLE_DOCS={result.eligible_documents}",
+        f"SELECTED_DOCS={result.selected_documents}",
+        f"PER_DOCUMENT_MIN={result.per_document_minimum}",
+        f"PER_DOCUMENT_MAX={result.per_document_maximum}",
+        f"MINIMUM_EXAMPLES={result.minimum_examples}",
+        f"MAXIMUM_EXAMPLES={result.maximum_examples}",
+    ]
+    if result.recommended_examples is not None:
+        lines.append(f"RECOMMENDED_EXAMPLES={result.recommended_examples}")
+    if shell:
+        console.print("\n".join(lines))
+        return
+
+    table = Table(title="Preflight")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Total rows", str(result.total_rows))
+    table.add_row("Eligible documents", str(result.eligible_documents))
+    table.add_row("Selected documents", str(result.selected_documents))
+    table.add_row("Per-document minimum", str(result.per_document_minimum))
+    table.add_row("Per-document maximum", str(result.per_document_maximum))
+    table.add_row("Minimum examples", str(result.minimum_examples))
+    table.add_row("Maximum examples", str(result.maximum_examples))
+    if result.recommended_examples is not None:
+        table.add_row("Recommended --examples", str(result.recommended_examples))
+    console.print(table)
+    console.print(Panel("\n".join(lines), title="Shell variables"))
 
 
 @app.command("run")
